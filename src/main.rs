@@ -10,12 +10,13 @@ use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, QoS};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tokio::time::{sleep, Instant};
+use tracing::{debug, error, info, warn};
 
 #[derive(Clone, Serialize)]
 struct LightView {
@@ -23,10 +24,24 @@ struct LightView {
     on: bool,
 }
 
+/// Latest reading from one BTHome sensor.
+#[derive(Clone, Serialize)]
+struct SensorView {
+    temp_c: Option<f64>,
+    humidity: Option<f64>,
+    /// Unix seconds of the last packet that carried a value.
+    last_seen: u64,
+}
+
 #[derive(Default, Clone, Serialize)]
 struct HomeState {
-    temp_c: Option<f32>,
-    humidity: Option<f32>,
+    /// Keyed by BLE address or MQTT topic, so two sensors in range each keep
+    /// their own readings instead of fighting over one slot.
+    sensors: BTreeMap<String, SensorView>,
+    /// Most recently reported value across all sensors, kept for consumers
+    /// that just want a single number.
+    temp_c: Option<f64>,
+    humidity: Option<f64>,
     lights: HashMap<String, LightView>,
 }
 
@@ -92,15 +107,41 @@ fn unindex(
     now_empty
 }
 
+/// What changed when an entity was registered.
+struct Registration {
+    is_new: bool,
+    /// State topics that had no owner before, so they still need a SUBSCRIBE.
+    new_topics: Vec<String>,
+    /// State topics this entity dropped from its config and nobody else owns;
+    /// the caller should UNSUBSCRIBE them.
+    freed_topics: Vec<String>,
+}
+
 impl LightRegistry {
-    /// Insert or replace an entity announced on `discovery_topic`; returns
-    /// `true` when it is new.
-    fn insert(&mut self, id: String, config: LightConfig, discovery_topic: &str) -> bool {
+    /// Insert or replace an entity announced on `discovery_topic`.
+    fn insert(
+        &mut self,
+        id: String,
+        config: LightConfig,
+        discovery_topic: &str,
+    ) -> Registration {
+        // Every indexed topic is already subscribed, so only unowned ones need
+        // a SUBSCRIBE. Computed before the indexes below are updated.
+        let new_topics: Vec<String> = config
+            .state_topics
+            .iter()
+            .filter(|topic| !self.by_state_topic.contains_key(*topic))
+            .cloned()
+            .collect();
+
+        let mut freed_topics = Vec::new();
         let previous_topics = self.by_id.get(&id).map(|c| c.state_topics.clone());
         if let Some(previous_topics) = previous_topics {
             for topic in previous_topics {
-                if !config.state_topics.contains(&topic) {
-                    unindex(&mut self.by_state_topic, &topic, &id);
+                if !config.state_topics.contains(&topic)
+                    && unindex(&mut self.by_state_topic, &topic, &id)
+                {
+                    freed_topics.push(topic);
                 }
             }
         }
@@ -128,7 +169,11 @@ impl LightRegistry {
             .or_default()
             .insert(id.clone());
 
-        self.by_id.insert(id, config).is_none()
+        Registration {
+            is_new: self.by_id.insert(id, config).is_none(),
+            new_topics,
+            freed_topics,
+        }
     }
 
     /// Remove every entity announced on this discovery topic. Returns the
@@ -366,9 +411,12 @@ fn decode_bthome(payload: &[u8]) -> Option<Vec<BthomeReading>> {
     let mut i = 1;
     while i < payload.len() {
         let id = payload[i];
-        let Some(spec) = BTHOME_OBJECTS.iter().find(|o| o.id == id) else {
-            debug!(object_id = %format!("0x{id:02x}"), offset = i, "unknown BTHome object; stopping");
-            break;
+        let spec = match BTHOME_OBJECTS.binary_search_by_key(&id, |o| o.id) {
+            Ok(index) => &BTHOME_OBJECTS[index],
+            Err(_) => {
+                debug!(object_id = %format!("0x{id:02x}"), offset = i, "unknown BTHome object; stopping");
+                break;
+            }
         };
 
         let len = spec.kind.len();
@@ -396,16 +444,86 @@ fn summarize_bthome(readings: &[BthomeReading]) -> String {
         .join(" ")
 }
 
-fn bthome_temperature_humidity(readings: &[BthomeReading]) -> (Option<f32>, Option<f32>) {
+/// First temperature and humidity in a packet. BTHome allows repeated object
+/// ids (e.g. internal + external probe); the first one is the primary reading.
+fn bthome_temperature_humidity(readings: &[BthomeReading]) -> (Option<f64>, Option<f64>) {
     let (mut temp, mut humidity) = (None, None);
     for reading in readings {
         match reading.name {
-            "temperature" if temp.is_none() => temp = Some(reading.value as f32),
-            "humidity" if humidity.is_none() => humidity = Some(reading.value as f32),
+            "temperature" if temp.is_none() => temp = Some(round2(reading.value)),
+            "humidity" if humidity.is_none() => humidity = Some(round2(reading.value)),
             _ => {}
         }
     }
     (temp, humidity)
+}
+
+/// Round to the 0.01 resolution BTHome uses for temperature/humidity, so
+/// binary floats don't leak artifacts like 42.830000000000002 into JSON.
+fn round2(value: f64) -> f64 {
+    (value * 100.0).round() / 100.0
+}
+
+fn unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Record one sensor update under its source identity (BLE address or MQTT
+/// topic). Metrics missing from this packet keep their previous value.
+fn record_sensor(state: &mut HomeState, source: &str, t: Option<f64>, h: Option<f64>, now: u64) {
+    if t.is_none() && h.is_none() {
+        return;
+    }
+
+    let sensor = state
+        .sensors
+        .entry(source.to_string())
+        .or_insert_with(|| SensorView {
+            temp_c: None,
+            humidity: None,
+            last_seen: now,
+        });
+    if t.is_some() {
+        sensor.temp_c = t;
+    }
+    if h.is_some() {
+        sensor.humidity = h;
+    }
+    sensor.last_seen = now;
+
+    if t.is_some() {
+        state.temp_c = t;
+    }
+    if h.is_some() {
+        state.humidity = h;
+    }
+}
+
+async fn record_bthome(ctx: &Arc<AppContext>, source: &str, readings: &[BthomeReading]) {
+    let (t, h) = bthome_temperature_humidity(readings);
+    if t.is_none() && h.is_none() {
+        return;
+    }
+    let mut state = ctx.state.write().await;
+    record_sensor(&mut state, source, t, h, unix_secs());
+}
+
+/// Proxies usually send a hex string, sometimes with a trailing newline; raw
+/// BTHome bytes are accepted too. Whitespace is ignored for hex text only, so
+/// it can't corrupt a raw packet that happens to contain 0x20/0x0a.
+fn bthome_bytes(payload: &[u8]) -> Vec<u8> {
+    if let Ok(text) = std::str::from_utf8(payload) {
+        let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        if !compact.is_empty() && compact.chars().all(|c| c.is_ascii_hexdigit()) {
+            if let Ok(bytes) = hex::decode(&compact) {
+                return bytes;
+            }
+        }
+    }
+    payload.to_vec()
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -429,112 +547,176 @@ fn expand_topic(base: Option<&str>, topic: &str) -> String {
 
 /// Scan the local Bluetooth adapter for BTHome advertisements and feed the
 /// same state the MQTT sensor topic feeds. BTHome v2 service data uses the
-/// 0xFCD2 UUID and starts with a 0x40-tagged byte, which `parse_bthome_v2`
+/// 0xFCD2 UUID and starts with a 0x40-tagged byte, which `decode_bthome`
 /// already understands.
+///
+/// Adapters come and go: a dongle can reset, `bluetoothd` can restart, and the
+/// event stream then just ends. So this is a supervisor that re-enumerates
+/// adapters and re-arms scanning with the same 1s -> 30s backoff as MQTT.
 async fn ble_scanner(ctx: Arc<AppContext>) {
-    use btleplug::api::bleuuid::uuid_from_u16;
-    use btleplug::api::{Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter};
+    const MIN_BACKOFF: Duration = Duration::from_secs(1);
+    const MAX_BACKOFF: Duration = Duration::from_secs(30);
+    // Sessions shorter than this are treated as failures, so a scan that dies
+    // right away backs off instead of spinning.
+    const HEALTHY_AFTER: Duration = Duration::from_secs(10);
+
+    let mut backoff = MIN_BACKOFF;
+    let mut failures = 0u32;
+
+    loop {
+        let started = Instant::now();
+        let outcome = run_ble_session(&ctx).await;
+        let ran_for = started.elapsed();
+
+        match &outcome {
+            Ok(()) => warn!("BLE event stream ended; restarting scan"),
+            Err(reason) if failures == 0 => {
+                warn!(%reason, retry_in = ?backoff, "BLE scanning unavailable")
+            }
+            Err(reason) => debug!(%reason, "BLE still unavailable"),
+        }
+
+        if ran_for >= HEALTHY_AFTER {
+            backoff = MIN_BACKOFF;
+            failures = 0;
+        } else {
+            failures = failures.saturating_add(1);
+        }
+
+        sleep(backoff).await;
+        backoff = (backoff * 2).min(MAX_BACKOFF);
+    }
+}
+
+/// One setup-and-run pass: enumerate adapters, start discovery, and consume
+/// their event streams until the first one stops. Dropping the `JoinSet` aborts
+/// any adapter still running, so the next pass starts from a clean slate.
+async fn run_ble_session(ctx: &Arc<AppContext>) -> Result<(), String> {
+    use btleplug::api::Manager as _;
     use btleplug::platform::Manager;
+    use tokio::task::JoinSet;
+
+    let manager = Manager::new()
+        .await
+        .map_err(|e| format!("BLE unavailable: {e}"))?;
+    let adapters = manager
+        .adapters()
+        .await
+        .map_err(|e| format!("could not list BLE adapters: {e}"))?;
+
+    if adapters.is_empty() {
+        return Err("no BLE adapters found".to_string());
+    }
+
+    let mut tasks = JoinSet::new();
+    for adapter in adapters {
+        let ctx = ctx.clone();
+        tasks.spawn(scan_adapter(ctx, adapter));
+    }
+
+    // A failing adapter (an onboard chip disabled in firmware, say) must not
+    // take a working adapter down with it, so keep waiting while any adapter
+    // still runs. An event stream that ends is different: that adapter was
+    // reset, so hand back to the supervisor to re-enumerate everything.
+    let mut last_error = None;
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(reason)) => {
+                debug!(%reason, "BLE adapter unavailable; other adapters still running");
+                last_error = Some(reason);
+            }
+            Err(join_error) => {
+                let reason = format!("BLE scan task failed: {join_error}");
+                debug!(%reason, "BLE adapter task failed; other adapters still running");
+                last_error = Some(reason);
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| "no BLE scan tasks started".to_string()))
+}
+
+/// Start discovery on one adapter and process its advertisements until the
+/// stream ends. Returns `Err` when scanning cannot be started at all.
+async fn scan_adapter(
+    ctx: Arc<AppContext>,
+    adapter: btleplug::platform::Adapter,
+) -> Result<(), String> {
+    use btleplug::api::bleuuid::uuid_from_u16;
+    use btleplug::api::{Central, CentralEvent, Peripheral as _, ScanFilter};
 
     let bthome_uuid = uuid_from_u16(0xFCD2);
 
-    let manager = match Manager::new().await {
-        Ok(manager) => manager,
-        Err(e) => {
-            warn!(error = %e, "BLE unavailable; BLE scanning disabled");
-            return;
-        }
-    };
+    // A previous pass may have left discovery running; clear it so this pass
+    // gets a fresh event stream. Fails harmlessly when already stopped.
+    let _ = adapter.stop_scan().await;
 
-    let adapters = match manager.adapters().await {
-        Ok(adapters) => adapters,
-        Err(e) => {
-            warn!(error = %e, "could not list BLE adapters");
-            return;
-        }
-    };
+    adapter
+        .start_scan(ScanFilter::default())
+        .await
+        .map_err(|e| format!("failed to start BLE scan: {e}"))?;
 
-    if adapters.is_empty() {
-        warn!("no BLE adapters found; BLE scanning disabled");
-        return;
-    }
+    let mut events = adapter
+        .events()
+        .await
+        .map_err(|e| format!("failed to open BLE event stream: {e}"))?;
 
-    for adapter in adapters {
-        if let Err(e) = adapter.start_scan(ScanFilter::default()).await {
-            warn!(error = %e, "failed to start BLE scan");
+    info!("BLE scan started");
+
+    while let Some(event) = events.next().await {
+        let CentralEvent::ServiceDataAdvertisement { id, service_data } = event else {
             continue;
-        }
-
-        let events = match adapter.events().await {
-            Ok(events) => events,
-            Err(e) => {
-                warn!(error = %e, "failed to open BLE event stream");
-                continue;
-            }
         };
 
-        info!("BLE scan started");
+        let address = adapter
+            .peripheral(&id)
+            .await
+            .map(|p| p.address().to_string())
+            .unwrap_or_else(|_| format!("{id:?}"));
 
-        let ctx = ctx.clone();
-        tokio::spawn(async move {
-            let mut events = events;
-            while let Some(event) = events.next().await {
-                let CentralEvent::ServiceDataAdvertisement { id, service_data } = event else {
-                    continue;
-                };
-
-                let address = adapter
-                    .peripheral(&id)
-                    .await
-                    .map(|p| p.address().to_string())
-                    .unwrap_or_else(|_| format!("{id:?}"));
-
-                for (uuid, data) in service_data {
-                    if uuid != bthome_uuid {
-                        debug!(%address, %uuid, hex = %hex::encode(&data), "BLE service data");
-                        continue;
-                    }
-
-                    ctx.bthome_packets.fetch_add(1, Ordering::Relaxed);
-                    let hex_payload = hex::encode(&data);
-                    debug!(%address, hex = %hex_payload, "BLE BTHome advertisement");
-
-                    let Some(readings) = decode_bthome(&data) else {
-                        warn!(
-                            %address,
-                            hex = %hex_payload,
-                            "BLE BTHome advertisement is encrypted or not v2"
-                        );
-                        continue;
-                    };
-
-                    let (t, h) = bthome_temperature_humidity(&readings);
-                    if readings.is_empty() {
-                        warn!(
-                            %address,
-                            hex = %hex_payload,
-                            "BLE BTHome advertisement had no supported objects"
-                        );
-                        continue;
-                    }
-
-                    info!(
-                        %address,
-                        objects = %summarize_bthome(&readings),
-                        temp_c = ?t,
-                        humidity = ?h,
-                        "BLE BTHome update"
-                    );
-
-                    if t.is_some() || h.is_some() {
-                        let mut state = ctx.state.write().await;
-                        if t.is_some() { state.temp_c = t; }
-                        if h.is_some() { state.humidity = h; }
-                    }
-                }
+        for (uuid, data) in service_data {
+            if uuid != bthome_uuid {
+                debug!(%address, %uuid, hex = %hex::encode(&data), "BLE service data");
+                continue;
             }
-        });
+
+            ctx.bthome_packets.fetch_add(1, Ordering::Relaxed);
+            let hex_payload = hex::encode(&data);
+            debug!(%address, hex = %hex_payload, "BLE BTHome advertisement");
+
+            let Some(readings) = decode_bthome(&data) else {
+                warn!(
+                    %address,
+                    hex = %hex_payload,
+                    "BLE BTHome advertisement is encrypted or not v2"
+                );
+                continue;
+            };
+
+            let (t, h) = bthome_temperature_humidity(&readings);
+            if readings.is_empty() {
+                warn!(
+                    %address,
+                    hex = %hex_payload,
+                    "BLE BTHome advertisement had no supported objects"
+                );
+                continue;
+            }
+
+            info!(
+                %address,
+                objects = %summarize_bthome(&readings),
+                temp_c = ?t,
+                humidity = ?h,
+                "BLE BTHome update"
+            );
+
+            record_bthome(&ctx, &address, &readings).await;
+        }
     }
+
+    Ok(())
 }
 
 #[tokio::main]
@@ -605,7 +787,7 @@ async fn main() {
                     bg_ctx
                         .requested_state
                         .lock()
-                        .expect("state request set poisoned")
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .clear();
                     for (topic, qos) in [
                         ("sensors/#", QoS::AtMostOnce),
@@ -623,17 +805,23 @@ async fn main() {
                     // Re-arm state subscriptions and ask each known device for its
                     // current value, since most of them only publish on change.
                     // Retained discovery replay calls this again; the request set
-                    // makes that a no-op instead of a duplicate round trip.
+                    // makes that a no-op instead of a duplicate round trip. State
+                    // topics are deduplicated because all channels of a multi-relay
+                    // device share the same RESULT/STATE topics.
                     let configs: Vec<LightConfig> = {
                         let reg = bg_ctx.lights.read().await;
                         reg.by_id.values().cloned().collect()
                     };
-                    for cfg in &configs {
-                        for topic in &cfg.state_topics {
-                            if let Err(e) = bg_ctx.mqtt.subscribe(topic, QoS::AtLeastOnce).await {
-                                warn!(error = %e, %topic, "failed to subscribe to light state");
-                            }
+                    let state_topics: HashSet<&str> = configs
+                        .iter()
+                        .flat_map(|cfg| cfg.state_topics.iter().map(String::as_str))
+                        .collect();
+                    for topic in state_topics {
+                        if let Err(e) = bg_ctx.mqtt.subscribe(topic, QoS::AtLeastOnce).await {
+                            warn!(error = %e, %topic, "failed to subscribe to light state");
                         }
+                    }
+                    for cfg in &configs {
                         if let Some(topic) = &cfg.request_topic {
                             request_state(&bg_ctx, topic).await;
                         }
@@ -664,8 +852,7 @@ async fn main() {
 
                             // Proxies usually send a hex string (e.g. "4002ca0903bf13"),
                             // but accept raw BTHome bytes too.
-                            let bytes = hex::decode(&msg.payload)
-                                .unwrap_or_else(|_| msg.payload.to_vec());
+                            let bytes = bthome_bytes(&msg.payload);
 
                             debug!(
                                 topic = %msg.topic,
@@ -698,9 +885,7 @@ async fn main() {
                                         );
                                     }
                                     if t.is_some() || h.is_some() {
-                                        let mut state = bg_ctx.state.write().await;
-                                        if t.is_some() { state.temp_c = t; }
-                                        if h.is_some() { state.humidity = h; }
+                                        record_bthome(&bg_ctx, &msg.topic, &readings).await;
                                     }
                                 }
                             }
@@ -751,8 +936,18 @@ async fn main() {
         .route("/api/lights/:id/toggle", post(toggle_light))
         .with_state(ctx);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:8082").await.unwrap();
-    info!("HTTP server listening on 0.0.0.0:8082");
+    // Bind on all interfaces by default; set BIND_ADDR=127.0.0.1:8082 to sit
+    // behind a reverse proxy, or to run a second instance on another port.
+    let bind_addr = env_or("BIND_ADDR", "0.0.0.0:8082");
+
+    let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            error!(error = %e, %bind_addr, "failed to bind HTTP listener; exiting");
+            return;
+        }
+    };
+    info!(%bind_addr, "HTTP server listening");
     axum::serve(listener, app).await.unwrap();
 }
 
@@ -988,7 +1183,7 @@ async fn register_light(
     config: LightConfig,
     discovery_topic: &str,
 ) {
-    let is_new = {
+    let registration = {
         let mut reg = ctx.lights.write().await;
         reg.insert(id.clone(), config.clone(), discovery_topic)
     };
@@ -1002,13 +1197,20 @@ async fn register_light(
         view.name = name;
     }
 
-    if is_new {
+    if registration.is_new {
         info!(%id, topics = ?config.state_topics, "discovered light");
     }
 
-    for topic in &config.state_topics {
+    // A topic shared by several channels is subscribed once, and one that
+    // already has an owner is already subscribed.
+    for topic in &registration.new_topics {
         if let Err(e) = ctx.mqtt.subscribe(topic, QoS::AtLeastOnce).await {
             warn!(error = %e, %topic, "failed to subscribe to light state");
+        }
+    }
+    for topic in &registration.freed_topics {
+        if let Err(e) = ctx.mqtt.unsubscribe(topic).await {
+            warn!(error = %e, %topic, "failed to unsubscribe from dropped state topic");
         }
     }
     if let Some(topic) = &config.request_topic {
@@ -1053,7 +1255,7 @@ async fn request_state(ctx: &Arc<AppContext>, topic: &str) {
     let first_request = ctx
         .requested_state
         .lock()
-        .expect("state request set poisoned")
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .insert(topic.to_string());
     if !first_request {
         return;
@@ -1067,7 +1269,7 @@ async fn request_state(ctx: &Arc<AppContext>, topic: &str) {
         warn!(error = %e, %topic, "failed to request light state");
         ctx.requested_state
             .lock()
-            .expect("state request set poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(topic);
     }
 }
@@ -1161,6 +1363,94 @@ mod tests {
     #[test]
     fn rejects_encrypted_packet() {
         assert!(decode_bthome(&hex::decode("4100").unwrap()).is_none());
+    }
+
+    #[test]
+    fn bthome_object_table_is_sorted_for_binary_search() {
+        assert!(
+            BTHOME_OBJECTS.windows(2).all(|pair| pair[0].id < pair[1].id),
+            "BTHOME_OBJECTS must stay strictly ascending by id"
+        );
+    }
+
+    #[test]
+    fn keeps_first_of_duplicate_temperature_objects() {
+        // 00 pid, 02 temp 28.32, 02 temp 20.00, 03 humidity 40.16
+        let readings = decode("40008402100b02d00703b00f");
+        let (t, h) = bthome_temperature_humidity(&readings);
+        assert_eq!(t, Some(28.32));
+        assert_eq!(h, Some(40.16));
+    }
+
+    #[test]
+    fn two_sensors_keep_their_own_readings() {
+        let mut state = HomeState::default();
+
+        record_sensor(&mut state, "A4:C1:38:19:C6:B0", Some(27.5), Some(42.8), 100);
+        record_sensor(&mut state, "AA:BB:CC:DD:EE:FF", Some(19.0), Some(55.0), 101);
+
+        assert_eq!(state.sensors.len(), 2);
+        assert_eq!(state.sensors["A4:C1:38:19:C6:B0"].temp_c, Some(27.5));
+        assert_eq!(state.sensors["A4:C1:38:19:C6:B0"].humidity, Some(42.8));
+        assert_eq!(state.sensors["AA:BB:CC:DD:EE:FF"].temp_c, Some(19.0));
+        assert_eq!(state.sensors["AA:BB:CC:DD:EE:FF"].humidity, Some(55.0));
+        // The single-value fields mirror the most recent report, not a blend.
+        assert_eq!(state.temp_c, Some(19.0));
+        assert_eq!(state.humidity, Some(55.0));
+    }
+
+    #[test]
+    fn a_packet_without_temperature_keeps_the_previous_one() {
+        let mut state = HomeState::default();
+
+        record_sensor(&mut state, "sensor", Some(27.5), Some(42.8), 100);
+        record_sensor(&mut state, "sensor", None, Some(43.1), 200);
+
+        assert_eq!(state.sensors["sensor"].temp_c, Some(27.5));
+        assert_eq!(state.sensors["sensor"].humidity, Some(43.1));
+        assert_eq!(state.sensors["sensor"].last_seen, 200);
+    }
+
+    #[test]
+    fn contact_only_packets_do_not_create_a_sensor() {
+        let mut state = HomeState::default();
+
+        record_sensor(&mut state, "sensor", None, None, 100);
+
+        assert!(state.sensors.is_empty());
+    }
+
+    #[test]
+    fn state_json_exposes_per_sensor_readings() {
+        let mut state = HomeState::default();
+        record_sensor(&mut state, "A4:C1:38:19:C6:B0", Some(27.5), Some(42.8), 100);
+
+        let json = serde_json::to_string(&state).unwrap();
+
+        assert!(
+            json.contains(
+                r#""sensors":{"A4:C1:38:19:C6:B0":{"temp_c":27.5,"humidity":42.8,"last_seen":100}}"#
+            ),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn mqtt_hex_with_trailing_newline_decodes() {
+        // A proxy that appends a newline must not be read as ASCII bytes.
+        let bytes = bthome_bytes(b"400084015302100b03b00f\r\n");
+        assert_eq!(bytes[0], 0x40);
+
+        let readings = decode_bthome(&bytes).unwrap();
+        let (t, h) = bthome_temperature_humidity(&readings);
+        assert_eq!(t, Some(28.32));
+        assert_eq!(h, Some(40.16));
+    }
+
+    #[test]
+    fn raw_bthome_bytes_are_not_mistaken_for_hex_text() {
+        let raw = [0x40, 0x00, 0xcb, 0x0c, 0x2b, 0x0b, 0x10, 0x00, 0x11, 0x01];
+        assert_eq!(bthome_bytes(&raw), raw.to_vec());
     }
 
     #[test]
@@ -1271,6 +1561,56 @@ mod tests {
         let mut ids = reg.ids_for_topic("stat/t/RESULT");
         ids.sort();
         assert_eq!(ids, vec!["tasmota_MAC_1", "tasmota_MAC_2"]);
+    }
+
+    #[test]
+    fn only_the_first_owner_of_a_topic_needs_a_subscribe() {
+        let mut reg = LightRegistry::default();
+
+        let first = reg.insert(
+            "tasmota_MAC_1".to_string(),
+            light_config(&["stat/t/RESULT", "tele/t/STATE"], Some("POWER1")),
+            "tasmota/discovery/MAC/config",
+        );
+        assert!(first.is_new);
+        assert_eq!(first.new_topics, vec!["stat/t/RESULT", "tele/t/STATE"]);
+
+        let second = reg.insert(
+            "tasmota_MAC_2".to_string(),
+            light_config(&["stat/t/RESULT", "tele/t/STATE"], Some("POWER2")),
+            "tasmota/discovery/MAC/config",
+        );
+        assert!(second.is_new);
+        assert!(second.new_topics.is_empty(), "topics already subscribed");
+
+        // Re-announcing an existing entity subscribes nothing either.
+        let again = reg.insert(
+            "tasmota_MAC_2".to_string(),
+            light_config(&["stat/t/RESULT", "tele/t/STATE"], Some("POWER2")),
+            "tasmota/discovery/MAC/config",
+        );
+        assert!(!again.is_new);
+        assert!(again.new_topics.is_empty());
+    }
+
+    #[test]
+    fn changing_a_state_topic_frees_the_old_one() {
+        let mut reg = LightRegistry::default();
+        reg.insert(
+            "lamp".to_string(),
+            light_config(&["stat/old"], None),
+            "homeassistant/switch/lamp/config",
+        );
+
+        let change = reg.insert(
+            "lamp".to_string(),
+            light_config(&["stat/new"], None),
+            "homeassistant/switch/lamp/config",
+        );
+
+        assert_eq!(change.freed_topics, vec!["stat/old"]);
+        assert_eq!(change.new_topics, vec!["stat/new"]);
+        assert!(reg.ids_for_topic("stat/old").is_empty());
     }
 
     #[test]
@@ -1392,15 +1732,15 @@ mod tests {
         let mut state = HomeState::default();
 
         assert_eq!(
-            flip_light(&mut state, "lamp", "ON", "OFF"),
+            flip_light(&mut state, "lamp", "lamp", "ON", "OFF"),
             (true, "ON".to_string())
         );
         assert_eq!(
-            flip_light(&mut state, "lamp", "ON", "OFF"),
+            flip_light(&mut state, "lamp", "lamp", "ON", "OFF"),
             (false, "OFF".to_string())
         );
         assert_eq!(
-            flip_light(&mut state, "lamp", "1", "0"),
+            flip_light(&mut state, "lamp", "lamp", "1", "0"),
             (true, "1".to_string())
         );
         assert!(state.lights["lamp"].on);
@@ -1410,7 +1750,7 @@ mod tests {
     fn failed_publish_reverts_optimistic_flip() {
         let mut state = HomeState::default();
 
-        let (optimistic_on, _) = flip_light(&mut state, "lamp", "ON", "OFF");
+        let (optimistic_on, _) = flip_light(&mut state, "lamp", "lamp", "ON", "OFF");
         assert!(optimistic_on);
         revert_flip(&mut state, "lamp", optimistic_on);
 
@@ -1418,10 +1758,19 @@ mod tests {
     }
 
     #[test]
+    fn a_new_light_view_uses_the_assigned_name() {
+        let mut state = HomeState::default();
+
+        flip_light(&mut state, "tasmota_x_1", "Tasmota Left", "ON", "OFF");
+
+        assert_eq!(state.lights["tasmota_x_1"].name, "Tasmota Left");
+    }
+
+    #[test]
     fn revert_does_not_clobber_a_newer_state_update() {
         let mut state = HomeState::default();
 
-        let (optimistic_on, _) = flip_light(&mut state, "lamp", "ON", "OFF");
+        let (optimistic_on, _) = flip_light(&mut state, "lamp", "lamp", "ON", "OFF");
         assert!(optimistic_on);
 
         // The device reported OFF between our flip and the failed publish.
@@ -1438,6 +1787,7 @@ async fn get_state(State(ctx): State<Arc<AppContext>>) -> Json<HomeState> {
 
 async fn toggle_light(Path(id): Path<String>, State(ctx): State<Arc<AppContext>>) -> StatusCode {
     let cfg = ctx.lights.read().await.by_id.get(&id).cloned();
+    let discovered = cfg.is_some();
 
     // Fall back to the legacy `lights/<id>/set` convention.
     let (topic, payload_on, payload_off) = match cfg {
@@ -1451,10 +1801,31 @@ async fn toggle_light(Path(id): Path<String>, State(ctx): State<Arc<AppContext>>
 
     // Decide the target *and* record it under one write lock. Two rapid
     // requests therefore alternate ON/OFF instead of both reading the same
-    // stale value and publishing the same command.
-    let (optimistic_on, payload) = {
+    // stale value and publishing the same command. The same lock rejects ids
+    // the app has never seen, so a stale tab or typo can't create a ghost
+    // switch in the UI.
+    let flip = {
         let mut state = ctx.state.write().await;
-        flip_light(&mut state, &id, &payload_on, &payload_off)
+        if discovered || state.lights.contains_key(&id) {
+            let name = state
+                .lights
+                .get(&id)
+                .map(|light| light.name.clone())
+                .unwrap_or_else(|| id.clone());
+            Some(flip_light(
+                &mut state,
+                &id,
+                &name,
+                &payload_on,
+                &payload_off,
+            ))
+        } else {
+            None
+        }
+    };
+    let Some((optimistic_on, payload)) = flip else {
+        debug!(%id, "ignoring toggle for unknown light");
+        return StatusCode::NOT_FOUND;
     };
 
     match ctx
@@ -1482,6 +1853,7 @@ async fn toggle_light(Path(id): Path<String>, State(ctx): State<Arc<AppContext>>
 fn flip_light(
     state: &mut HomeState,
     id: &str,
+    name: &str,
     payload_on: &str,
     payload_off: &str,
 ) -> (bool, String) {
@@ -1489,7 +1861,7 @@ fn flip_light(
         .lights
         .entry(id.to_string())
         .or_insert_with(|| LightView {
-            name: id.to_string(),
+            name: name.to_string(),
             on: false,
         });
     light.on = !light.on;

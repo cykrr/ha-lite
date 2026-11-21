@@ -6,17 +6,59 @@
   <style>
     body { font-family: system-ui, sans-serif; max-width: 400px; margin: 2rem auto; padding: 0 1rem; }
     button { width: 100%; padding: 1rem; margin: 0.5rem 0; font-size: 1.1rem; cursor: pointer; }
+    .sensor { padding: 0.5rem 0; border-bottom: 1px solid #ddd; }
+    .sensor .name { font-size: 0.8rem; color: #555; }
+    .sensor .values { font-size: 1.1rem; }
+    .empty { color: #777; font-style: italic; padding: 0.5rem 0; }
   </style>
 </head>
 <body>
-  <h2>Temp: <span id="temp">--</span> °C | Humidity: <span id="hum">--</span> %</h2>
+  <h2>Sensors</h2>
+  <div id="sensors"></div>
   <div id="lights"></div>
   <script>
+    function fmt(value, unit) {
+      return value == null ? '--' : `${value.toFixed(1)} ${unit}`;
+    }
+
+    function age(timestamp) {
+      if (!timestamp) return '';
+      const secs = Math.max(0, Math.round(Date.now() / 1000 - timestamp));
+      if (secs < 60) return `${secs}s ago`;
+      if (secs < 3600) return `${Math.round(secs / 60)}m ago`;
+      return `${Math.round(secs / 3600)}h ago`;
+    }
+
     async function refresh() {
       const res = await fetch('/api/state');
       const data = await res.json();
-      document.getElementById('temp').textContent = data.temp_c?.toFixed(1) ?? '--';
-      document.getElementById('hum').textContent = data.humidity?.toFixed(1) ?? '--';
+
+      const sensorBox = document.getElementById('sensors');
+      sensorBox.replaceChildren();
+      const sensors = Object.entries(data.sensors ?? {});
+      if (sensors.length === 0) {
+        const placeholder = document.createElement('div');
+        placeholder.className = 'empty';
+        placeholder.textContent = 'Waiting for sensor data…';
+        sensorBox.appendChild(placeholder);
+      }
+      for (const [id, sensor] of sensors) {
+        const row = document.createElement('div');
+        row.className = 'sensor';
+
+        const name = document.createElement('div');
+        name.className = 'name';
+        name.textContent = sensor.last_seen ? `${id} · ${age(sensor.last_seen)}` : id;
+
+        const values = document.createElement('div');
+        values.className = 'values';
+        values.textContent =
+          `${fmt(sensor.temp_c, '°C')} · ${fmt(sensor.humidity, '% humidity')}`;
+
+        row.append(name, values);
+        sensorBox.appendChild(row);
+      }
+
       const container = document.getElementById('lights');
       container.replaceChildren();
       for (const [id, light] of Object.entries(data.lights)) {
@@ -35,4 +77,3 @@
   </script>
 </body>
 </html>
-
