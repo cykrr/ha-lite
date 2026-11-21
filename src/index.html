@@ -1,0 +1,38 @@
+<!doctype html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HA Lite</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 400px; margin: 2rem auto; padding: 0 1rem; }
+    button { width: 100%; padding: 1rem; margin: 0.5rem 0; font-size: 1.1rem; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <h2>Temp: <span id="temp">--</span> °C | Humidity: <span id="hum">--</span> %</h2>
+  <div id="lights"></div>
+  <script>
+    async function refresh() {
+      const res = await fetch('/api/state');
+      const data = await res.json();
+      document.getElementById('temp').textContent = data.temp_c?.toFixed(1) ?? '--';
+      document.getElementById('hum').textContent = data.humidity?.toFixed(1) ?? '--';
+      const container = document.getElementById('lights');
+      container.replaceChildren();
+      for (const [id, light] of Object.entries(data.lights)) {
+        const btn = document.createElement('button');
+        btn.textContent = `${light.name}: ${light.on ? 'ON' : 'OFF'}`;
+        btn.addEventListener('click', () => toggle(id));
+        container.appendChild(btn);
+      }
+    }
+    async function toggle(id) {
+      await fetch(`/api/lights/${encodeURIComponent(id)}/toggle`, { method: 'POST' });
+      setTimeout(refresh, 150);
+    }
+    setInterval(refresh, 2000);
+    refresh();
+  </script>
+</body>
+</html>
+
