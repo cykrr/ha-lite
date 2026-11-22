@@ -1,0 +1,50 @@
+# Maintainer: krr <krr@users.noreply.github.com>
+pkgname=ha-lite-git
+_pkgname=ha-lite
+pkgver=r15.ff4efa5
+pkgrel=1
+pkgdesc='Small Home Assistant MQTT bridge for BTHome sensors and lights'
+arch=('x86_64' 'aarch64')
+url='https://github.com/cykrr/ha-lite'
+license=('GPL-2.0-only')
+depends=('dbus')
+makedepends=('cargo' 'git' 'pkgconf')
+optdepends=('bluez: scan BTHome advertisements with a local Bluetooth adapter')
+provides=("$_pkgname")
+conflicts=("$_pkgname")
+backup=('etc/ha-lite/ha-lite.env')
+source=("$_pkgname::git+$url.git"
+        'ha-lite.service'
+        'ha-lite.sysusers'
+        'ha-lite.env')
+sha256sums=('SKIP'
+            '2124becb55223f1bc2169177cfa6888d350ba019d2dcaa1a7ce8ce74d1b70582'
+            '5b88a59401dfef28d9bb2c460eaae9360189c2b272c77f17a0c8cf1742ce4be1'
+            '9e081943a9f005864378033b7761ba0fa47fdf5fe3eb6b2fe899721902a580b4')
+
+pkgver() {
+  cd "$_pkgname"
+  printf 'r%s.%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+prepare() {
+  cd "$_pkgname"
+  cargo fetch --locked
+}
+
+build() {
+  cd "$_pkgname"
+  cargo build --release --frozen
+}
+
+check() {
+  cd "$_pkgname"
+  cargo test --frozen
+}
+
+package() {
+  install -Dm0755 "$_pkgname/target/release/$_pkgname" "$pkgdir/usr/bin/$_pkgname"
+  install -Dm0644 "$srcdir/ha-lite.service" "$pkgdir/usr/lib/systemd/system/ha-lite.service"
+  install -Dm0644 "$srcdir/ha-lite.sysusers" "$pkgdir/usr/lib/sysusers.d/ha-lite.conf"
+  install -Dm0640 "$srcdir/ha-lite.env" "$pkgdir/etc/ha-lite/ha-lite.env"
+}

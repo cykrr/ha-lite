@@ -1,0 +1,32 @@
+[Unit]
+Description=ha-lite Home Assistant MQTT bridge
+Documentation=https://github.com/cykrr/ha-lite
+After=network-online.target bluetooth.target
+Wants=network-online.target bluetooth.target
+
+[Service]
+Type=simple
+User=ha-lite
+Group=ha-lite
+SupplementaryGroups=bluetooth
+EnvironmentFile=-/etc/ha-lite/ha-lite.env
+ExecStart=/usr/bin/ha-lite
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=20s
+SyslogIdentifier=ha-lite
+
+# The app only needs the network and the system D-Bus (BlueZ).
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target
