@@ -14,7 +14,7 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use tokio::time::{sleep, Instant};
 use tracing::{debug, error, info, warn};
 
@@ -216,7 +216,50 @@ struct AppContext {
     /// State topics already asked for a snapshot on this MQTT connection, so
     /// the reconnect re-arm and the retained discovery replay don't both ask.
     requested_state: Mutex<HashSet<String>>,
+    /// Used directly by HTTP handlers, which run outside the MQTT event loop.
+    /// Never await this from inside `eventloop.poll()`; use [`Self::mqtt_request`].
     mqtt: AsyncClient,
+    /// Outbound requests created while handling an MQTT event.
+    ///
+    /// `AsyncClient` feeds a bounded channel that only `EventLoop::poll` drains.
+    /// Awaiting `subscribe`/`publish` from the task that is *running* `poll`
+    /// blocks that task, so a burst larger than the channel capacity (32) would
+    /// wedge the event loop forever. A reconnect re-arming enough lights is
+    /// enough to do it. These commands are sent by a separate worker instead.
+    mqtt_requests: mpsc::UnboundedSender<MqttCommand>,
+}
+
+/// One outbound MQTT request queued for the request worker.
+enum MqttCommand {
+    Subscribe(String, QoS),
+    Unsubscribe(String),
+    Publish(String, Vec<u8>, QoS, bool),
+}
+
+impl AppContext {
+    fn mqtt_request(&self, request: MqttCommand) {
+        // Only fails once the worker (and therefore the process) is going away.
+        if self.mqtt_requests.send(request).is_err() {
+            warn!("MQTT request worker stopped; dropping request");
+        }
+    }
+
+    fn mqtt_subscribe(&self, topic: &str, qos: QoS) {
+        self.mqtt_request(MqttCommand::Subscribe(topic.to_string(), qos));
+    }
+
+    fn mqtt_unsubscribe(&self, topic: &str) {
+        self.mqtt_request(MqttCommand::Unsubscribe(topic.to_string()));
+    }
+
+    fn mqtt_publish(&self, topic: &str, payload: Vec<u8>, qos: QoS, retain: bool) {
+        self.mqtt_request(MqttCommand::Publish(
+            topic.to_string(),
+            payload,
+            qos,
+            retain,
+        ));
+    }
 }
 
 /// Subset of a Home Assistant MQTT discovery payload that ha-lite understands.
@@ -719,6 +762,38 @@ async fn scan_adapter(
     Ok(())
 }
 
+/// Drains queued requests into the client, and therefore into the event loop.
+///
+/// This task is allowed to block when the client's bounded channel is full:
+/// `poll()` keeps running and drains it. Doing the same awaits from the
+/// event-loop task itself is what deadlocks, since nothing would drain the
+/// channel while it waits.
+async fn run_mqtt_requests(
+    client: AsyncClient,
+    mut requests: mpsc::UnboundedReceiver<MqttCommand>,
+) {
+    while let Some(request) = requests.recv().await {
+        match request {
+            MqttCommand::Subscribe(topic, qos) => {
+                if let Err(e) = client.subscribe(&topic, qos).await {
+                    warn!(error = %e, %topic, "failed to subscribe");
+                }
+            }
+            MqttCommand::Unsubscribe(topic) => {
+                if let Err(e) = client.unsubscribe(&topic).await {
+                    warn!(error = %e, %topic, "failed to unsubscribe");
+                }
+            }
+            MqttCommand::Publish(topic, payload, qos, retain) => {
+                if let Err(e) = client.publish(&topic, qos, retain, payload).await {
+                    warn!(error = %e, %topic, "failed to publish");
+                }
+            }
+        }
+    }
+    debug!("MQTT request worker stopped");
+}
+
 #[tokio::main]
 async fn main() {
     // Load .env before the subscriber so RUST_LOG can be set there too.
@@ -745,12 +820,17 @@ async fn main() {
     }
 
     let (client, mut eventloop) = AsyncClient::new(mqttoptions, 32);
+    // The event-loop task must never await `client`: its 32-slot request
+    // channel is only drained by `poll()`, which is the task that would block.
+    let (mqtt_requests, mqtt_request_rx) = mpsc::unbounded_channel();
+    tokio::spawn(run_mqtt_requests(client.clone(), mqtt_request_rx));
     let ctx = Arc::new(AppContext {
         state: RwLock::new(HomeState::default()),
         lights: RwLock::new(LightRegistry::default()),
         bthome_packets: AtomicU64::new(0),
         requested_state: Mutex::new(HashSet::new()),
-        mqtt: client.clone(),
+        mqtt: client,
+        mqtt_requests,
     });
 
     // An empty BTHome feed should be loud, not silent.
@@ -797,9 +877,7 @@ async fn main() {
                         ("homeassistant/#", QoS::AtLeastOnce),
                         ("tasmota/discovery/#", QoS::AtLeastOnce),
                     ] {
-                        if let Err(e) = bg_ctx.mqtt.subscribe(topic, qos).await {
-                            warn!(error = %e, topic, "failed to subscribe");
-                        }
+                        bg_ctx.mqtt_subscribe(topic, qos);
                     }
 
                     // Re-arm state subscriptions and ask each known device for its
@@ -817,13 +895,11 @@ async fn main() {
                         .flat_map(|cfg| cfg.state_topics.iter().map(String::as_str))
                         .collect();
                     for topic in state_topics {
-                        if let Err(e) = bg_ctx.mqtt.subscribe(topic, QoS::AtLeastOnce).await {
-                            warn!(error = %e, %topic, "failed to subscribe to light state");
-                        }
+                        bg_ctx.mqtt_subscribe(topic, QoS::AtLeastOnce);
                     }
                     for cfg in &configs {
                         if let Some(topic) = &cfg.request_topic {
-                            request_state(&bg_ctx, topic).await;
+                            request_state(&bg_ctx, topic);
                         }
                     }
                 }
@@ -1204,17 +1280,13 @@ async fn register_light(
     // A topic shared by several channels is subscribed once, and one that
     // already has an owner is already subscribed.
     for topic in &registration.new_topics {
-        if let Err(e) = ctx.mqtt.subscribe(topic, QoS::AtLeastOnce).await {
-            warn!(error = %e, %topic, "failed to subscribe to light state");
-        }
+        ctx.mqtt_subscribe(topic, QoS::AtLeastOnce);
     }
     for topic in &registration.freed_topics {
-        if let Err(e) = ctx.mqtt.unsubscribe(topic).await {
-            warn!(error = %e, %topic, "failed to unsubscribe from dropped state topic");
-        }
+        ctx.mqtt_unsubscribe(topic);
     }
     if let Some(topic) = &config.request_topic {
-        request_state(ctx, topic).await;
+        request_state(ctx, topic);
     }
 }
 
@@ -1239,9 +1311,7 @@ async fn remove_discovery(ctx: &Arc<AppContext>, discovery_topic: &str) {
     }
 
     for topic in freed_topics {
-        if let Err(e) = ctx.mqtt.unsubscribe(&topic).await {
-            warn!(error = %e, %topic, "failed to unsubscribe from removed state topic");
-        }
+        ctx.mqtt_unsubscribe(&topic);
     }
 
     info!(%discovery_topic, ids = ?removed, "removed light(s)");
@@ -1249,9 +1319,9 @@ async fn remove_discovery(ctx: &Arc<AppContext>, discovery_topic: &str) {
 
 /// Publish an empty payload to ask a device for its current state. OpenBeken
 /// uses the channel's `/get` topic for this, Tasmota uses `cmnd/<topic>/STATE`.
-/// Each topic is asked at most once per MQTT connection; a failed publish clears
-/// the mark so a later call can retry.
-async fn request_state(ctx: &Arc<AppContext>, topic: &str) {
+/// Each topic is asked at most once per MQTT connection; the mark is cleared
+/// on reconnect, and publishing failures are logged by the request worker.
+fn request_state(ctx: &AppContext, topic: &str) {
     let first_request = ctx
         .requested_state
         .lock()
@@ -1261,17 +1331,7 @@ async fn request_state(ctx: &Arc<AppContext>, topic: &str) {
         return;
     }
 
-    if let Err(e) = ctx
-        .mqtt
-        .publish(topic, QoS::AtLeastOnce, false, Vec::<u8>::new())
-        .await
-    {
-        warn!(error = %e, %topic, "failed to request light state");
-        ctx.requested_state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(topic);
-    }
+    ctx.mqtt_publish(topic, Vec::new(), QoS::AtLeastOnce, false);
 }
 
 async fn handle_light_state(ctx: &Arc<AppContext>, topic: &str, payload: &[u8]) {
@@ -1828,6 +1888,10 @@ async fn toggle_light(Path(id): Path<String>, State(ctx): State<Arc<AppContext>>
         return StatusCode::NOT_FOUND;
     };
 
+    // Safe to await here: HTTP handlers run outside the MQTT event-loop task,
+    // so the loop is free to drain this request. Keeping it direct (rather
+    // than queueing) is what lets us report a publish failure and undo the
+    // optimistic flip.
     match ctx
         .mqtt
         .publish(&topic, QoS::AtLeastOnce, false, payload.clone())
