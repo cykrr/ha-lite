@@ -9,8 +9,7 @@ use std::{
 use rumqttc::QoS;
 use tracing::{debug, info};
 
-use crate::app::{AppContext, LightView, HomeState};
-use crate::mqtt::request_state;
+use crate::app::{AppContext, HomeState, LightView};
 
 #[derive(Clone)]
 pub(crate) struct LightConfig {
@@ -243,13 +242,13 @@ pub(crate) async fn register_light(
     // A topic shared by several channels is subscribed once, and one that
     // already has an owner is already subscribed.
     for topic in &registration.new_topics {
-        ctx.mqtt_subscribe(topic, QoS::AtLeastOnce);
+        ctx.mqtt.subscribe(topic, QoS::AtLeastOnce);
     }
     for topic in &registration.freed_topics {
-        ctx.mqtt_unsubscribe(topic);
+        ctx.mqtt.unsubscribe(topic);
     }
     if let Some(topic) = &config.request_topic {
-        request_state(ctx, topic);
+        ctx.mqtt.request_state(topic);
     }
 }
 
@@ -272,7 +271,7 @@ pub(crate) async fn forget_lights(
     }
 
     for topic in freed_topics {
-        ctx.mqtt_unsubscribe(&topic);
+        ctx.mqtt.unsubscribe(&topic);
     }
 }
 

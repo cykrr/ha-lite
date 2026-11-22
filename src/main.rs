@@ -12,10 +12,9 @@ mod lights;
 mod mqtt;
 
 use std::{
-    collections::HashSet,
     sync::{
-        atomic::{AtomicBool, AtomicU64},
-        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+        Arc,
     },
     time::Duration,
 };
@@ -25,8 +24,8 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use rumqttc::{AsyncClient, MqttOptions};
-use tokio::sync::{mpsc, RwLock};
+use rumqttc::MqttOptions;
+use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
 use app::{AppContext, HomeState};
@@ -104,19 +103,12 @@ async fn main() {
         mqttoptions.set_credentials(user, password);
     }
 
-    let (client, eventloop) = AsyncClient::new(mqttoptions, 32);
-    // The event-loop task must never await `client`: its 32-slot request
-    // channel is only drained by `poll()`, which is the task that would block.
-    let (mqtt_requests, mqtt_request_rx) = mpsc::unbounded_channel();
-    tokio::spawn(mqtt::run_mqtt_requests(client.clone(), mqtt_request_rx));
+    let (mqtt, eventloop) = mqtt::connect(mqttoptions, 32);
     let ctx = Arc::new(AppContext {
         state: RwLock::new(HomeState::default()),
         lights: RwLock::new(LightRegistry::default()),
         bthome_packets: AtomicU64::new(0),
-        requested_state: Mutex::new(HashSet::new()),
-        mqtt_connected: AtomicBool::new(false),
-        mqtt: client,
-        mqtt_requests,
+        mqtt,
     });
 
     // An empty BTHome feed should be loud, not silent.
@@ -126,7 +118,7 @@ async fn main() {
         let mut waited_secs = 0u64;
         loop {
             tokio::time::sleep(Duration::from_secs(60)).await;
-            if watch_ctx.bthome_packets.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+            if watch_ctx.bthome_packets.load(Ordering::Relaxed) > 0 {
                 break;
             }
             waited_secs += 60;

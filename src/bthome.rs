@@ -5,6 +5,8 @@
 
 use std::sync::Arc;
 
+use tracing::{info, warn};
+
 use crate::app::{record_sensor, unix_secs, AppContext};
 
 #[derive(Clone, Copy)]
@@ -217,12 +219,48 @@ fn round2(value: f64) -> f64 {
     (value * 100.0).round() / 100.0
 }
 
-pub(crate) async fn record_bthome(
+/// Decode and record one BTHome payload, whichever feed it arrived on.
+///
+/// `bytes` must already be raw BTHome bytes: callers that receive hex text
+/// decode it first via [`bthome_bytes`]. `transport` labels the log lines so a
+/// warning still says which feed produced it.
+pub(crate) async fn process_bthome(
     ctx: &Arc<AppContext>,
+    transport: &'static str,
     source: &str,
-    readings: &[BthomeReading],
+    bytes: &[u8],
 ) {
-    let (t, h) = bthome_temperature_humidity(readings);
+    let hex_payload = hex::encode(bytes);
+    let Some(readings) = decode_bthome(bytes) else {
+        warn!(
+            transport,
+            source = %source,
+            hex = %hex_payload,
+            "BTHome payload is encrypted or not v2"
+        );
+        return;
+    };
+
+    if readings.is_empty() {
+        warn!(
+            transport,
+            source = %source,
+            hex = %hex_payload,
+            "BTHome payload had no supported objects"
+        );
+        return;
+    }
+
+    let (t, h) = bthome_temperature_humidity(&readings);
+    info!(
+        transport,
+        source = %source,
+        objects = %summarize_bthome(&readings),
+        temp_c = ?t,
+        humidity = ?h,
+        "BTHome update"
+    );
+
     if t.is_none() && h.is_none() {
         return;
     }
@@ -313,5 +351,17 @@ mod tests {
     fn raw_bthome_bytes_are_not_mistaken_for_hex_text() {
         let raw = [0x40, 0x00, 0xcb, 0x0c, 0x2b, 0x0b, 0x10, 0x00, 0x11, 0x01];
         assert_eq!(bthome_bytes(&raw), raw.to_vec());
+    }
+
+    #[tokio::test]
+    async fn ble_payloads_are_never_hex_decoded() {
+        // `process_bthome` takes raw bytes. MQTT is the only feed that runs
+        // `bthome_bytes`, so an advertisement that happens to look like hex
+        // text must not be reinterpreted here.
+        let (ctx, _eventloop, _requests) = crate::app::test_ctx(false, 4);
+
+        process_bthome(&ctx, "BLE", "AA:BB:CC:DD:EE:FF", b"400084015302100b03b00f").await;
+
+        assert!(ctx.state.read().await.sensors.is_empty());
     }
 }

@@ -1,6 +1,6 @@
 //! HTTP surface: serve the UI, expose state, and accept light commands.
 
-use std::sync::{atomic::Ordering, Arc};
+use std::sync::Arc;
 
 use axum::{
     extract::{Path, State},
@@ -48,7 +48,7 @@ pub(crate) async fn toggle_light(
         // it would keep returning Ok while disconnected and then block once
         // the 32-slot queue filled. Check the session flag before flipping, so
         // an offline broker fails fast and no optimistic state is written.
-        if !ctx.mqtt_connected.load(Ordering::Relaxed) {
+        if !ctx.mqtt.is_connected() {
             warn!(%id, "MQTT broker is not connected; rejecting light command");
             return StatusCode::BAD_GATEWAY;
         }
@@ -122,7 +122,12 @@ mod tests {
         // Occupy the only slot. A connected broker with a stalled event loop
         // looks like this to the handler.
         ctx.mqtt
-            .try_publish("unrelated/topic", rumqttc::QoS::AtMostOnce, false, "x")
+            .try_publish(
+                "unrelated/topic",
+                rumqttc::QoS::AtMostOnce,
+                false,
+                b"x".to_vec(),
+            )
             .expect("first publish fits");
 
         let status = toggle_light(Path("lamp".to_string()), State(ctx.clone())).await;

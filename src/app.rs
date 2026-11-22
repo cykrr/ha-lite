@@ -5,22 +5,21 @@
 //! handler may touch visible in a single place.
 
 use std::{
-    collections::{BTreeMap, HashSet},
-    sync::{
-        atomic::{AtomicBool, AtomicU64},
-        Mutex,
-    },
+    collections::BTreeMap,
+    sync::atomic::AtomicU64,
     time::{SystemTime, UNIX_EPOCH},
 };
 
-#[cfg(test)]
-use std::sync::Arc;
-
-use rumqttc::{AsyncClient, QoS};
 use serde::Serialize;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::RwLock;
 
 use crate::lights::LightRegistry;
+use crate::mqtt::MqttLink;
+
+#[cfg(test)]
+use std::sync::Arc;
+#[cfg(test)]
+use tokio::sync::mpsc;
 
 #[derive(Clone, Serialize)]
 pub(crate) struct LightView {
@@ -55,60 +54,7 @@ pub(crate) struct AppContext {
     pub(crate) state: RwLock<HomeState>,
     pub(crate) lights: RwLock<LightRegistry>,
     pub(crate) bthome_packets: AtomicU64,
-    /// State topics already asked for a snapshot on this MQTT connection, so
-    /// the reconnect re-arm and the retained discovery replay don't both ask.
-    pub(crate) requested_state: Mutex<HashSet<String>>,
-    /// Whether the event loop currently has a live broker session. `publish`
-    /// only reports a closed request channel, not a dead connection, so a
-    /// toggle consults this flag instead of assuming success while the broker
-    /// is unreachable.
-    pub(crate) mqtt_connected: AtomicBool,
-    /// Only touched by HTTP handlers, which run outside the MQTT event loop.
-    /// It's used with [`AsyncClient::try_publish`] so a full request queue
-    /// can't stall a request. Never touch this from inside `eventloop.poll()`;
-    /// use the request queue instead.
-    pub(crate) mqtt: AsyncClient,
-    /// Outbound requests created while handling an MQTT event.
-    ///
-    /// `AsyncClient` feeds a bounded channel that only `EventLoop::poll` drains.
-    /// Awaiting `subscribe`/`publish` from the task that is *running* `poll`
-    /// blocks that task, so a burst larger than the channel capacity (32) would
-    /// wedge the event loop forever. A reconnect re-arming enough lights is
-    /// enough to do it. These commands are sent by a separate worker instead.
-    pub(crate) mqtt_requests: mpsc::UnboundedSender<MqttCommand>,
-}
-
-/// One outbound MQTT request queued for the request worker.
-pub(crate) enum MqttCommand {
-    Subscribe(String, QoS),
-    Unsubscribe(String),
-    Publish(String, Vec<u8>, QoS, bool),
-}
-
-impl AppContext {
-    pub(crate) fn mqtt_request(&self, request: MqttCommand) {
-        // Only fails once the worker (and therefore the process) is going away.
-        if self.mqtt_requests.send(request).is_err() {
-            tracing::warn!("MQTT request worker stopped; dropping request");
-        }
-    }
-
-    pub(crate) fn mqtt_subscribe(&self, topic: &str, qos: QoS) {
-        self.mqtt_request(MqttCommand::Subscribe(topic.to_string(), qos));
-    }
-
-    pub(crate) fn mqtt_unsubscribe(&self, topic: &str) {
-        self.mqtt_request(MqttCommand::Unsubscribe(topic.to_string()));
-    }
-
-    pub(crate) fn mqtt_publish(&self, topic: &str, payload: Vec<u8>, qos: QoS, retain: bool) {
-        self.mqtt_request(MqttCommand::Publish(
-            topic.to_string(),
-            payload,
-            qos,
-            retain,
-        ));
-    }
+    pub(crate) mqtt: MqttLink,
 }
 
 /// Record one sensor update under its source identity (BLE address or MQTT
@@ -167,19 +113,17 @@ pub(crate) fn test_ctx(
 ) -> (
     Arc<AppContext>,
     rumqttc::EventLoop,
-    mpsc::UnboundedReceiver<MqttCommand>,
+    mpsc::UnboundedReceiver<crate::mqtt::MqttCommand>,
 ) {
     let (client, eventloop) =
-        AsyncClient::new(rumqttc::MqttOptions::new("test", "127.0.0.1", 1), capacity);
-    let (requests, request_rx) = mpsc::unbounded_channel();
+        rumqttc::AsyncClient::new(rumqttc::MqttOptions::new("test", "127.0.0.1", 1), capacity);
+    let (mqtt, request_rx) = MqttLink::new(client);
+    mqtt.set_connected(connected);
     let ctx = Arc::new(AppContext {
         state: RwLock::new(HomeState::default()),
         lights: RwLock::new(LightRegistry::default()),
         bthome_packets: AtomicU64::new(0),
-        requested_state: Mutex::new(HashSet::new()),
-        mqtt_connected: AtomicBool::new(connected),
-        mqtt: client,
-        mqtt_requests: requests,
+        mqtt,
     });
     (ctx, eventloop, request_rx)
 }

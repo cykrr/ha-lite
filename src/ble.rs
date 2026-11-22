@@ -3,14 +3,17 @@
 //! BLE hardware is unreliable, so this is a supervisor around a one-shot
 //! session: adapters are re-enumerated and scanning re-armed with backoff.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{atomic::Ordering, Arc},
+    time::Duration,
+};
 
 use futures::StreamExt;
 use tokio::time::{sleep, Instant};
 use tracing::{debug, info, warn};
 
 use crate::app::AppContext;
-use crate::bthome::{bthome_temperature_humidity, decode_bthome, record_bthome, summarize_bthome};
+use crate::bthome::process_bthome;
 
 /// Stop discovery on every adapter on the way out. BlueZ remembers an active
 /// scan per client, so a clean exit avoids leaving a stale scan behind for the
@@ -174,39 +177,16 @@ async fn scan_adapter(
                 continue;
             }
 
-            ctx.bthome_packets
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let hex_payload = hex::encode(&data);
-            debug!(%address, hex = %hex_payload, "BLE BTHome advertisement");
-
-            let Some(readings) = decode_bthome(&data) else {
-                warn!(
-                    %address,
-                    hex = %hex_payload,
-                    "BLE BTHome advertisement is encrypted or not v2"
-                );
-                continue;
-            };
-
-            let (t, h) = bthome_temperature_humidity(&readings);
-            if readings.is_empty() {
-                warn!(
-                    %address,
-                    hex = %hex_payload,
-                    "BLE BTHome advertisement had no supported objects"
-                );
-                continue;
-            }
-
-            info!(
+            ctx.bthome_packets.fetch_add(1, Ordering::Relaxed);
+            debug!(
                 %address,
-                objects = %summarize_bthome(&readings),
-                temp_c = ?t,
-                humidity = ?h,
-                "BLE BTHome update"
+                hex = %hex::encode(&data),
+                "BLE BTHome advertisement"
             );
 
-            record_bthome(&ctx, &address, &readings).await;
+            // Advertisements are already raw bytes; only the MQTT feed needs
+            // hex detection.
+            process_bthome(&ctx, "BLE", &address, &data).await;
         }
     }
 
