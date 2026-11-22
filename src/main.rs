@@ -176,16 +176,25 @@ impl LightRegistry {
         }
     }
 
-    /// Remove every entity announced on this discovery topic. Returns the
-    /// removed ids and any state topics that no longer have an owner.
-    fn remove_by_discovery_topic(&mut self, discovery_topic: &str) -> (Vec<String>, Vec<String>) {
-        let Some(ids) = self.by_discovery_topic.remove(discovery_topic) else {
-            return (Vec::new(), Vec::new());
-        };
-
+    /// Remove entities by id, forgetting both indexes. Returns the ids that
+    /// existed and any state topics that no longer have an owner.
+    fn remove_ids(&mut self, ids: impl IntoIterator<Item = String>) -> (Vec<String>, Vec<String>) {
         let mut removed = Vec::new();
         let mut freed_topics = Vec::new();
+
         for id in ids {
+            // An entity normally has exactly one discovery topic, but clear
+            // every index entry rather than assuming that.
+            let indexed_topics: Vec<String> = self
+                .by_discovery_topic
+                .iter()
+                .filter(|(_, ids)| ids.contains(&id))
+                .map(|(topic, _)| topic.clone())
+                .collect();
+            for topic in indexed_topics {
+                unindex(&mut self.by_discovery_topic, &topic, &id);
+            }
+
             let Some(config) = self.by_id.remove(&id) else {
                 continue;
             };
@@ -198,6 +207,37 @@ impl LightRegistry {
         }
 
         (removed, freed_topics)
+    }
+
+    /// Remove every entity announced on this discovery topic.
+    fn remove_by_discovery_topic(&mut self, discovery_topic: &str) -> (Vec<String>, Vec<String>) {
+        let ids: Vec<String> = self
+            .by_discovery_topic
+            .get(discovery_topic)
+            .map(|ids| ids.iter().cloned().collect())
+            .unwrap_or_default();
+        self.remove_ids(ids)
+    }
+
+    /// Remove entities this discovery topic used to announce but no longer
+    /// does. A Tasmota config can shrink (a relay is disabled) without the
+    /// discovery topic itself being deleted.
+    fn retain_discovery_topic(
+        &mut self,
+        discovery_topic: &str,
+        keep: &HashSet<String>,
+    ) -> (Vec<String>, Vec<String>) {
+        let stale: Vec<String> = self
+            .by_discovery_topic
+            .get(discovery_topic)
+            .map(|ids| {
+                ids.iter()
+                    .filter(|id| !keep.contains(*id))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.remove_ids(stale)
     }
 
     /// Every entity whose state may be carried by this topic.
@@ -1057,7 +1097,22 @@ async fn handle_discovery(
         return;
     };
 
+    // One discovery topic describes one entity. If a re-announcement changes
+    // `uniq_id`, no deletion message will ever arrive for the old one, so drop
+    // it here instead of leaving a dead switch in the UI. Register first: an
+    // entity that keeps the same state topic should not be unsubscribed just
+    // to be subscribed again.
+    let announced = HashSet::from([entity.id.clone()]);
     register_light(ctx, entity.id, entity.name, entity.config, discovery_topic).await;
+
+    let (removed, freed_topics) = {
+        let mut reg = ctx.lights.write().await;
+        reg.retain_discovery_topic(discovery_topic, &announced)
+    };
+    forget_lights(ctx, &removed, freed_topics).await;
+    if !removed.is_empty() {
+        info!(%discovery_topic, ids = ?removed, "replaced light(s)");
+    }
 }
 
 struct HaEntity {
@@ -1140,20 +1195,35 @@ async fn handle_tasmota_discovery(
     };
 
     let entities = tasmota_entities(mac, &cfg);
+    let announced: HashSet<String> = entities.iter().map(|entity| entity.id.clone()).collect();
+
     if entities.is_empty() {
         debug!(%mac, %device_topic, "Tasmota device has no relay/light channels");
-        return;
+    } else {
+        for entity in entities {
+            info!(
+                %mac,
+                %device_topic,
+                kind = entity.kind,
+                id = %entity.id,
+                "discovered Tasmota channel"
+            );
+            register_light(ctx, entity.id, entity.name, entity.config, discovery_topic).await;
+        }
     }
 
-    for entity in entities {
-        info!(
-            %mac,
-            %device_topic,
-            kind = entity.kind,
-            id = %entity.id,
-            "discovered Tasmota channel"
-        );
-        register_light(ctx, entity.id, entity.name, entity.config, discovery_topic).await;
+    // A retained config can shrink without being deleted: relays get disabled
+    // or the device becomes sensor-only. Evict whatever this topic used to
+    // announce and no longer does, otherwise the UI keeps dead switches. This
+    // runs after registration so a surviving channel keeps its shared state
+    // topic subscribed without an unsubscribe/subscribe round trip.
+    let (removed, freed_topics) = {
+        let mut reg = ctx.lights.write().await;
+        reg.retain_discovery_topic(discovery_topic, &announced)
+    };
+    forget_lights(ctx, &removed, freed_topics).await;
+    if !removed.is_empty() {
+        info!(%mac, %device_topic, ids = ?removed, "removed stale Tasmota channel(s)");
     }
 }
 
@@ -1298,6 +1368,25 @@ async fn register_light(
     }
 }
 
+/// Drop entities from the UI and stop listening to state topics that lost
+/// their last owner.
+async fn forget_lights(ctx: &AppContext, removed: &[String], freed_topics: Vec<String>) {
+    if removed.is_empty() {
+        return;
+    }
+
+    {
+        let mut state = ctx.state.write().await;
+        for id in removed {
+            state.lights.remove(id);
+        }
+    }
+
+    for topic in freed_topics {
+        ctx.mqtt_unsubscribe(&topic);
+    }
+}
+
 /// Remove every entity announced by a retained discovery config that has been
 /// cleared (empty payload), the standard "device deleted" signal.
 async fn remove_discovery(ctx: &Arc<AppContext>, discovery_topic: &str) {
@@ -1311,17 +1400,7 @@ async fn remove_discovery(ctx: &Arc<AppContext>, discovery_topic: &str) {
         return;
     }
 
-    {
-        let mut state = ctx.state.write().await;
-        for id in &removed {
-            state.lights.remove(id);
-        }
-    }
-
-    for topic in freed_topics {
-        ctx.mqtt_unsubscribe(&topic);
-    }
-
+    forget_lights(ctx, &removed, freed_topics).await;
     info!(%discovery_topic, ids = ?removed, "removed light(s)");
 }
 
@@ -1696,6 +1775,49 @@ mod tests {
         assert_eq!(change.freed_topics, vec!["stat/old"]);
         assert_eq!(change.new_topics, vec!["stat/new"]);
         assert!(reg.ids_for_topic("stat/old").is_empty());
+    }
+
+    #[test]
+    fn shrinking_a_tasmota_config_evicts_vanished_channels() {
+        let mut reg = LightRegistry::default();
+        let topic = "tasmota/discovery/MAC/config";
+        for n in 1..=2 {
+            let key = format!("POWER{n}");
+            reg.insert(
+                format!("tasmota_MAC_{n}"),
+                light_config(&["stat/t/RESULT"], Some(key.as_str())),
+                topic,
+            );
+        }
+
+        let keep = HashSet::from(["tasmota_MAC_1".to_string()]);
+        let (removed, freed_topics) = reg.retain_discovery_topic(topic, &keep);
+
+        assert_eq!(removed, vec!["tasmota_MAC_2"]);
+        assert!(freed_topics.is_empty(), "channel 1 still owns the topic");
+        assert_eq!(reg.ids_for_topic("stat/t/RESULT"), vec!["tasmota_MAC_1"]);
+        assert!(!reg.by_id.contains_key("tasmota_MAC_2"));
+    }
+
+    #[test]
+    fn dropping_the_last_channel_frees_the_shared_topic() {
+        let mut reg = LightRegistry::default();
+        let topic = "tasmota/discovery/MAC/config";
+        for n in 1..=2 {
+            let key = format!("POWER{n}");
+            reg.insert(
+                format!("tasmota_MAC_{n}"),
+                light_config(&["stat/t/RESULT"], Some(key.as_str())),
+                topic,
+            );
+        }
+
+        let (mut removed, freed_topics) = reg.retain_discovery_topic(topic, &HashSet::new());
+
+        removed.sort();
+        assert_eq!(removed, vec!["tasmota_MAC_1", "tasmota_MAC_2"]);
+        assert_eq!(freed_topics, vec!["stat/t/RESULT"]);
+        assert!(reg.by_state_topic.is_empty());
     }
 
     #[test]
