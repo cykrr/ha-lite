@@ -8,7 +8,7 @@ use axum::{
 use futures::StreamExt;
 use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, QoS};
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     sync::{Arc, Mutex},
@@ -258,8 +258,15 @@ struct AppContext {
     /// State topics already asked for a snapshot on this MQTT connection, so
     /// the reconnect re-arm and the retained discovery replay don't both ask.
     requested_state: Mutex<HashSet<String>>,
-    /// Used directly by HTTP handlers, which run outside the MQTT event loop.
-    /// Never await this from inside `eventloop.poll()`; use [`Self::mqtt_request`].
+    /// Whether the event loop currently has a live broker session. `publish`
+    /// only reports a closed request channel, not a dead connection, so a
+    /// toggle consults this flag instead of assuming success while the broker
+    /// is unreachable.
+    mqtt_connected: AtomicBool,
+    /// Only touched by HTTP handlers, which run outside the MQTT event loop.
+    /// It's used with [`AsyncClient::try_publish`] so a full request queue
+    /// can't stall a request. Never touch this from inside `eventloop.poll()`;
+    /// use [`Self::mqtt_request`].
     mqtt: AsyncClient,
     /// Outbound requests created while handling an MQTT event.
     ///
@@ -937,6 +944,7 @@ async fn main() {
         lights: RwLock::new(LightRegistry::default()),
         bthome_packets: AtomicU64::new(0),
         requested_state: Mutex::new(HashSet::new()),
+        mqtt_connected: AtomicBool::new(false),
         mqtt: client,
         mqtt_requests,
     });
@@ -971,6 +979,7 @@ async fn main() {
             match eventloop.poll().await {
                 Ok(Event::Incoming(Incoming::ConnAck(_))) => {
                     info!("connected to MQTT broker");
+                    bg_ctx.mqtt_connected.store(true, Ordering::Relaxed);
                     backoff = Duration::from_secs(1);
                     bg_ctx
                         .requested_state
@@ -1102,6 +1111,7 @@ async fn main() {
                 }
                 Ok(_) => {}
                 Err(e) => {
+                    bg_ctx.mqtt_connected.store(false, Ordering::Relaxed);
                     warn!(
                         error = %e,
                         retry_in_secs = backoff.as_secs(),
@@ -1576,45 +1586,44 @@ async fn toggle_light(Path(id): Path<String>, State(ctx): State<Arc<AppContext>>
         ),
     };
 
-    // Decide the target *and* record it under one write lock. Two rapid
-    // requests therefore alternate ON/OFF instead of both reading the same
-    // stale value and publishing the same command. The same lock rejects ids
-    // the app has never seen, so a stale tab or typo can't create a ghost
-    // switch in the UI.
-    let flip = {
-        let mut state = ctx.state.write().await;
-        if discovered || state.lights.contains_key(&id) {
-            let name = state
-                .lights
-                .get(&id)
-                .map(|light| light.name.clone())
-                .unwrap_or_else(|| id.clone());
-            Some(flip_light(
-                &mut state,
-                &id,
-                &name,
-                &payload_on,
-                &payload_off,
-            ))
-        } else {
-            None
-        }
-    };
-    let Some((optimistic_on, payload)) = flip else {
+    // Unknown ids are a client error whether or not the broker is up, so they
+    // still get a 404 instead of a misleading gateway error, and a stale tab
+    // can't create a ghost switch in the UI.
+    if !discovered && !ctx.state.read().await.lights.contains_key(&id) {
         debug!(%id, "ignoring toggle for unknown light");
         return StatusCode::NOT_FOUND;
+    }
+
+    // `publish` only reports a closed request channel, not a dead broker: it
+    // would keep returning Ok while disconnected and then block once the
+    // 32-slot queue filled. Check the session flag first, so an offline broker
+    // fails fast and the optimistic flip is never made.
+    if !ctx.mqtt_connected.load(Ordering::Relaxed) {
+        warn!(%id, "MQTT broker is not connected; rejecting light command");
+        return StatusCode::BAD_GATEWAY;
+    }
+
+    // Decide the target *and* record it under one write lock. Two rapid
+    // requests therefore alternate ON/OFF instead of both reading the same
+    // stale value and publishing the same command.
+    let (optimistic_on, payload) = {
+        let mut state = ctx.state.write().await;
+        let name = state
+            .lights
+            .get(&id)
+            .map(|light| light.name.clone())
+            .unwrap_or_else(|| id.clone());
+        flip_light(&mut state, &id, &name, &payload_on, &payload_off)
     };
 
-    // Safe to await here: HTTP handlers run outside the MQTT event-loop task,
-    // so the loop is free to drain this request. Keeping it direct (rather
-    // than queueing) is what lets us report a publish failure and undo the
-    // optimistic flip.
+    // `try_publish` never waits for the event loop: if the 32-slot request
+    // queue is full it fails now, so the request can't stall and the optimistic
+    // flip can be undone before the client sees a response.
     match ctx
         .mqtt
-        .publish(&topic, QoS::AtLeastOnce, false, payload.clone())
-        .await
+        .try_publish(&topic, QoS::AtLeastOnce, false, payload.clone())
     {
-        Ok(_) => {
+        Ok(()) => {
             debug!(%id, %payload, %topic, "sent light command");
             StatusCode::NO_CONTENT
         }
@@ -1622,7 +1631,7 @@ async fn toggle_light(Path(id): Path<String>, State(ctx): State<Arc<AppContext>>
             // The command never left, so undo the optimistic flip unless a
             // real state update arrived in the meantime.
             revert_flip(&mut *ctx.state.write().await, &id, optimistic_on);
-            warn!(error = %e, %id, "failed to publish light command");
+            warn!(error = %e, %id, "failed to queue light command");
             StatusCode::BAD_GATEWAY
         }
     }
@@ -2189,5 +2198,73 @@ mod tests {
         revert_flip(&mut state, "lamp", optimistic_on);
 
         assert!(!state.lights["lamp"].on, "authoritative state must win");
+    }
+
+    /// An `AppContext` whose MQTT client is connected to nothing, so the
+    /// handler's publish path can be exercised without a broker. The returned
+    /// `EventLoop` owns the request receiver: dropping it makes every publish
+    /// fail for the wrong reason, so tests keep it alive.
+    fn test_ctx(connected: bool, capacity: usize) -> (Arc<AppContext>, rumqttc::EventLoop) {
+        let (client, eventloop) = AsyncClient::new(MqttOptions::new("test", "127.0.0.1", 1), capacity);
+        let (requests, _request_rx) = mpsc::unbounded_channel();
+        let ctx = Arc::new(AppContext {
+            state: RwLock::new(HomeState::default()),
+            lights: RwLock::new(LightRegistry::default()),
+            bthome_packets: AtomicU64::new(0),
+            requested_state: Mutex::new(HashSet::new()),
+            mqtt_connected: AtomicBool::new(connected),
+            mqtt: client,
+            mqtt_requests: requests,
+        });
+        (ctx, eventloop)
+    }
+
+    #[tokio::test]
+    async fn offline_toggle_is_rejected_without_flipping() {
+        let (ctx, _eventloop) = test_ctx(false, 4);
+        ctx.state.write().await.lights.insert(
+            "lamp".to_string(),
+            LightView {
+                name: "Lamp".to_string(),
+                on: false,
+            },
+        );
+
+        let status = toggle_light(Path("lamp".to_string()), State(ctx.clone())).await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(!ctx.state.read().await.lights["lamp"].on);
+    }
+
+    #[tokio::test]
+    async fn unknown_light_is_404_even_while_offline() {
+        let (ctx, _eventloop) = test_ctx(false, 4);
+
+        let status = toggle_light(Path("ghost".to_string()), State(ctx.clone())).await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(ctx.state.read().await.lights.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_full_request_queue_reverts_the_toggle_instead_of_blocking() {
+        let (ctx, _eventloop) = test_ctx(true, 1);
+        ctx.state.write().await.lights.insert(
+            "lamp".to_string(),
+            LightView {
+                name: "Lamp".to_string(),
+                on: false,
+            },
+        );
+        // Occupy the only slot. A connected broker with a stalled event loop
+        // looks like this to the handler.
+        ctx.mqtt
+            .try_publish("unrelated/topic", QoS::AtMostOnce, false, "x")
+            .expect("first publish fits");
+
+        let status = toggle_light(Path("lamp".to_string()), State(ctx.clone())).await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(!ctx.state.read().await.lights["lamp"].on, "flip must be undone");
     }
 }
