@@ -42,7 +42,9 @@ struct HomeState {
     /// that just want a single number.
     temp_c: Option<f64>,
     humidity: Option<f64>,
-    lights: HashMap<String, LightView>,
+    /// Sorted like `sensors`, so `/api/state` is stable between polls and the
+    /// UI order does not jitter.
+    lights: BTreeMap<String, LightView>,
 }
 
 #[derive(Clone)]
@@ -628,6 +630,25 @@ fn expand_topic(base: Option<&str>, topic: &str) -> String {
     }
 }
 
+/// Stop discovery on every adapter on the way out. BlueZ remembers an active
+/// scan per client, so a clean exit avoids leaving a stale scan behind for the
+/// next start. Best effort: this runs while shutting down, so errors are
+/// ignored (a stopped or vanished adapter is fine).
+async fn stop_ble_scans() {
+    use btleplug::api::{Central as _, Manager as _};
+    use btleplug::platform::Manager;
+
+    let Ok(manager) = Manager::new().await else {
+        return;
+    };
+    let Ok(adapters) = manager.adapters().await else {
+        return;
+    };
+    for adapter in adapters {
+        let _ = adapter.stop_scan().await;
+    }
+}
+
 /// Scan the local Bluetooth adapter for BTHome advertisements and feed the
 /// same state the MQTT sensor topic feeds. BTHome v2 service data uses the
 /// 0xFCD2 UUID and starts with a 0x40-tagged byte, which `decode_bthome`
@@ -659,7 +680,9 @@ async fn ble_scanner(ctx: Arc<AppContext>) {
             Err(reason) => debug!(%reason, "BLE still unavailable"),
         }
 
-        if ran_for >= HEALTHY_AFTER {
+        let healthy = ran_for >= HEALTHY_AFTER;
+        if healthy {
+            // A healthy run earns a fresh 1s retry for whatever comes next.
             backoff = MIN_BACKOFF;
             failures = 0;
         } else {
@@ -667,7 +690,12 @@ async fn ble_scanner(ctx: Arc<AppContext>) {
         }
 
         sleep(backoff).await;
-        backoff = (backoff * 2).min(MAX_BACKOFF);
+
+        // Only grow the delay after a failure. Doubling unconditionally would
+        // make the first failure after a healthy session wait 2s, not 1s.
+        if !healthy {
+            backoff = (backoff * 2).min(MAX_BACKOFF);
+        }
     }
 }
 
@@ -1064,7 +1092,20 @@ async fn main() {
         }
     };
     info!(%bind_addr, "HTTP server listening");
-    axum::serve(listener, app).await.unwrap();
+    let shutdown = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            warn!(error = %e, "failed to listen for shutdown signal");
+        }
+    };
+    if let Err(e) = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await
+    {
+        error!(error = %e, "HTTP server failed");
+    }
+
+    stop_ble_scans().await;
+    info!("shutting down");
 }
 
 async fn handle_discovery(
@@ -1477,6 +1518,108 @@ async fn handle_light_state(ctx: &Arc<AppContext>, topic: &str, payload: &[u8]) 
     }
 }
 
+async fn get_state(State(ctx): State<Arc<AppContext>>) -> Json<HomeState> {
+    Json(ctx.state.read().await.clone())
+}
+
+async fn toggle_light(Path(id): Path<String>, State(ctx): State<Arc<AppContext>>) -> StatusCode {
+    let cfg = ctx.lights.read().await.by_id.get(&id).cloned();
+    let discovered = cfg.is_some();
+
+    // Fall back to the legacy `lights/<id>/set` convention.
+    let (topic, payload_on, payload_off) = match cfg {
+        Some(cfg) => (cfg.command_topic, cfg.payload_on, cfg.payload_off),
+        None => (
+            format!("lights/{id}/set"),
+            "ON".to_string(),
+            "OFF".to_string(),
+        ),
+    };
+
+    // Decide the target *and* record it under one write lock. Two rapid
+    // requests therefore alternate ON/OFF instead of both reading the same
+    // stale value and publishing the same command. The same lock rejects ids
+    // the app has never seen, so a stale tab or typo can't create a ghost
+    // switch in the UI.
+    let flip = {
+        let mut state = ctx.state.write().await;
+        if discovered || state.lights.contains_key(&id) {
+            let name = state
+                .lights
+                .get(&id)
+                .map(|light| light.name.clone())
+                .unwrap_or_else(|| id.clone());
+            Some(flip_light(
+                &mut state,
+                &id,
+                &name,
+                &payload_on,
+                &payload_off,
+            ))
+        } else {
+            None
+        }
+    };
+    let Some((optimistic_on, payload)) = flip else {
+        debug!(%id, "ignoring toggle for unknown light");
+        return StatusCode::NOT_FOUND;
+    };
+
+    // Safe to await here: HTTP handlers run outside the MQTT event-loop task,
+    // so the loop is free to drain this request. Keeping it direct (rather
+    // than queueing) is what lets us report a publish failure and undo the
+    // optimistic flip.
+    match ctx
+        .mqtt
+        .publish(&topic, QoS::AtLeastOnce, false, payload.clone())
+        .await
+    {
+        Ok(_) => {
+            debug!(%id, %payload, %topic, "sent light command");
+            StatusCode::NO_CONTENT
+        }
+        Err(e) => {
+            // The command never left, so undo the optimistic flip unless a
+            // real state update arrived in the meantime.
+            revert_flip(&mut *ctx.state.write().await, &id, optimistic_on);
+            warn!(error = %e, %id, "failed to publish light command");
+            StatusCode::BAD_GATEWAY
+        }
+    }
+}
+
+/// Flip a light inside a single mutable borrow and return the new state plus
+/// the command payload. Keeping the read and the write together is what makes
+/// concurrent toggles serialize instead of racing.
+fn flip_light(
+    state: &mut HomeState,
+    id: &str,
+    name: &str,
+    payload_on: &str,
+    payload_off: &str,
+) -> (bool, String) {
+    let light = state
+        .lights
+        .entry(id.to_string())
+        .or_insert_with(|| LightView {
+            name: name.to_string(),
+            on: false,
+        });
+    light.on = !light.on;
+    let payload = if light.on { payload_on } else { payload_off };
+    (light.on, payload.to_string())
+}
+
+/// Undo an optimistic flip after a failed publish, but only while the light
+/// still holds our value: a real state update may have superseded it.
+fn revert_flip(state: &mut HomeState, id: &str, expected_on: bool) {
+    if let Some(light) = state.lights.get_mut(id) {
+        if light.on == expected_on {
+            light.on = !expected_on;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1580,6 +1723,27 @@ mod tests {
             ),
             "{json}"
         );
+    }
+
+    #[test]
+    fn light_json_order_is_stable() {
+        let mut state = HomeState::default();
+        for id in ["zulu", "alpha", "mike"] {
+            state.lights.insert(
+                id.to_string(),
+                LightView {
+                    name: id.to_string(),
+                    on: false,
+                },
+            );
+        }
+
+        let json = serde_json::to_string(&state).unwrap();
+        let alpha = json.find("\"alpha\"").unwrap();
+        let mike = json.find("\"mike\"").unwrap();
+        let zulu = json.find("\"zulu\"").unwrap();
+
+        assert!(alpha < mike && mike < zulu, "{json}");
     }
 
     #[test]
@@ -1985,107 +2149,5 @@ mod tests {
         revert_flip(&mut state, "lamp", optimistic_on);
 
         assert!(!state.lights["lamp"].on, "authoritative state must win");
-    }
-}
-
-async fn get_state(State(ctx): State<Arc<AppContext>>) -> Json<HomeState> {
-    Json(ctx.state.read().await.clone())
-}
-
-async fn toggle_light(Path(id): Path<String>, State(ctx): State<Arc<AppContext>>) -> StatusCode {
-    let cfg = ctx.lights.read().await.by_id.get(&id).cloned();
-    let discovered = cfg.is_some();
-
-    // Fall back to the legacy `lights/<id>/set` convention.
-    let (topic, payload_on, payload_off) = match cfg {
-        Some(cfg) => (cfg.command_topic, cfg.payload_on, cfg.payload_off),
-        None => (
-            format!("lights/{id}/set"),
-            "ON".to_string(),
-            "OFF".to_string(),
-        ),
-    };
-
-    // Decide the target *and* record it under one write lock. Two rapid
-    // requests therefore alternate ON/OFF instead of both reading the same
-    // stale value and publishing the same command. The same lock rejects ids
-    // the app has never seen, so a stale tab or typo can't create a ghost
-    // switch in the UI.
-    let flip = {
-        let mut state = ctx.state.write().await;
-        if discovered || state.lights.contains_key(&id) {
-            let name = state
-                .lights
-                .get(&id)
-                .map(|light| light.name.clone())
-                .unwrap_or_else(|| id.clone());
-            Some(flip_light(
-                &mut state,
-                &id,
-                &name,
-                &payload_on,
-                &payload_off,
-            ))
-        } else {
-            None
-        }
-    };
-    let Some((optimistic_on, payload)) = flip else {
-        debug!(%id, "ignoring toggle for unknown light");
-        return StatusCode::NOT_FOUND;
-    };
-
-    // Safe to await here: HTTP handlers run outside the MQTT event-loop task,
-    // so the loop is free to drain this request. Keeping it direct (rather
-    // than queueing) is what lets us report a publish failure and undo the
-    // optimistic flip.
-    match ctx
-        .mqtt
-        .publish(&topic, QoS::AtLeastOnce, false, payload.clone())
-        .await
-    {
-        Ok(_) => {
-            debug!(%id, %payload, %topic, "sent light command");
-            StatusCode::NO_CONTENT
-        }
-        Err(e) => {
-            // The command never left, so undo the optimistic flip unless a
-            // real state update arrived in the meantime.
-            revert_flip(&mut *ctx.state.write().await, &id, optimistic_on);
-            warn!(error = %e, %id, "failed to publish light command");
-            StatusCode::BAD_GATEWAY
-        }
-    }
-}
-
-/// Flip a light inside a single mutable borrow and return the new state plus
-/// the command payload. Keeping the read and the write together is what makes
-/// concurrent toggles serialize instead of racing.
-fn flip_light(
-    state: &mut HomeState,
-    id: &str,
-    name: &str,
-    payload_on: &str,
-    payload_off: &str,
-) -> (bool, String) {
-    let light = state
-        .lights
-        .entry(id.to_string())
-        .or_insert_with(|| LightView {
-            name: name.to_string(),
-            on: false,
-        });
-    light.on = !light.on;
-    let payload = if light.on { payload_on } else { payload_off };
-    (light.on, payload.to_string())
-}
-
-/// Undo an optimistic flip after a failed publish, but only while the light
-/// still holds our value: a real state update may have superseded it.
-fn revert_flip(state: &mut HomeState, id: &str, expected_on: bool) {
-    if let Some(light) = state.lights.get_mut(id) {
-        if light.on == expected_on {
-            light.on = !expected_on;
-        }
     }
 }
