@@ -1089,24 +1089,32 @@ async fn main() {
                                 "unhandled sensor topic"
                             );
                         }
-                    } else if let Some(id) = msg
-                        .topic
-                        .strip_prefix("lights/")
-                        .and_then(|s| s.strip_suffix("/state"))
-                    {
-                        // Legacy convention: lights/<id>/state with ON/OFF payloads.
-                        let is_on = msg.payload.as_ref() == b"ON";
-                        let mut state = bg_ctx.state.write().await;
-                        state
-                            .lights
-                            .entry(id.to_string())
-                            .or_insert_with(|| LightView {
-                                name: id.to_string(),
-                                on: is_on,
-                            })
-                            .on = is_on;
-                    } else {
-                        handle_light_state(&bg_ctx, &msg.topic, &msg.payload).await;
+                    } else if !handle_light_state(&bg_ctx, &msg.topic, &msg.payload).await {
+                        // Legacy convention: `lights/<id>/state` with ON/OFF
+                        // payloads. Discovered entities get first claim on the
+                        // topic, and only a single-segment id matches the
+                        // `lights/+/state` subscription, so a nested `stat_t`
+                        // can't be mistaken for a legacy light.
+                        if let Some(id) = legacy_light_id(&msg.topic) {
+                            match legacy_light_state(&msg.payload) {
+                                Some(is_on) => {
+                                    let mut state = bg_ctx.state.write().await;
+                                    state
+                                        .lights
+                                        .entry(id.to_string())
+                                        .or_insert_with(|| LightView {
+                                            name: id.to_string(),
+                                            on: is_on,
+                                        })
+                                        .on = is_on;
+                                }
+                                None => debug!(
+                                    topic = %msg.topic,
+                                    payload = %String::from_utf8_lossy(&msg.payload),
+                                    "ignoring malformed legacy light state"
+                                ),
+                            }
+                        }
                     }
                 }
                 Ok(_) => {}
@@ -1512,7 +1520,30 @@ fn request_state(ctx: &AppContext, topic: &str) {
     ctx.mqtt_publish(topic, Vec::new(), QoS::AtLeastOnce, false);
 }
 
-async fn handle_light_state(ctx: &Arc<AppContext>, topic: &str, payload: &[u8]) {
+/// Match the legacy `lights/<id>/state` convention. Only a single-segment id
+/// matches the `lights/+/state` subscription, so nested paths belong to a
+/// discovered entity's `stat_t`.
+fn legacy_light_id(topic: &str) -> Option<&str> {
+    topic
+        .strip_prefix("lights/")
+        .and_then(|rest| rest.strip_suffix("/state"))
+        .filter(|id| !id.is_empty() && !id.contains('/'))
+}
+
+/// Legacy lights use exactly `ON` and `OFF`; anything else is malformed and
+/// must not be read as OFF.
+fn legacy_light_state(payload: &[u8]) -> Option<bool> {
+    match payload {
+        b"ON" => Some(true),
+        b"OFF" => Some(false),
+        _ => None,
+    }
+}
+
+/// Apply a state payload to every discovered entity that owns `topic`.
+/// Returns whether any entity claimed the topic, so the caller can fall back
+/// to the legacy convention only for unowned topics.
+async fn handle_light_state(ctx: &Arc<AppContext>, topic: &str, payload: &[u8]) -> bool {
     let configs: Vec<(String, LightConfig)> = {
         let reg = ctx.lights.read().await;
         reg.ids_for_topic(topic)
@@ -1522,14 +1553,14 @@ async fn handle_light_state(ctx: &Arc<AppContext>, topic: &str, payload: &[u8]) 
     };
 
     if configs.is_empty() {
-        return;
+        return false;
     }
 
     let raw = String::from_utf8_lossy(payload);
     let raw = raw.trim();
     if raw.is_empty() {
         // Our own empty state request echoed back by the broker.
-        return;
+        return true;
     }
 
     // Parse once when any entity on this topic expects JSON (Tasmota).
@@ -1538,7 +1569,7 @@ async fn handle_light_state(ctx: &Arc<AppContext>, topic: &str, payload: &[u8]) 
             Ok(json) => Some(json),
             Err(e) => {
                 debug!(error = %e, topic, payload = raw, "light state is not JSON");
-                return;
+                return true;
             }
         }
     } else {
@@ -1566,6 +1597,8 @@ async fn handle_light_state(ctx: &Arc<AppContext>, topic: &str, payload: &[u8]) 
             light.on = is_on;
         }
     }
+
+    true
 }
 
 async fn get_state(State(ctx): State<Arc<AppContext>>) -> Json<HomeState> {
@@ -1900,6 +1933,56 @@ mod tests {
             payload_off: "OFF".to_string(),
             state_key: state_key.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn legacy_light_id_only_matches_one_segment() {
+        assert_eq!(legacy_light_id("lights/lamp/state"), Some("lamp"));
+        assert_eq!(legacy_light_id("lights/bedroom/ceiling/state"), None);
+        assert_eq!(legacy_light_id("lights//state"), None);
+        assert_eq!(legacy_light_id("lights/lamp/set"), None);
+        assert_eq!(legacy_light_id("sensors/lamp/state"), None);
+    }
+
+    #[test]
+    fn legacy_light_state_requires_explicit_on_or_off() {
+        assert_eq!(legacy_light_state(b"ON"), Some(true));
+        assert_eq!(legacy_light_state(b"OFF"), Some(false));
+        assert_eq!(legacy_light_state(b""), None);
+        assert_eq!(legacy_light_state(b" ON "), None);
+        assert_eq!(legacy_light_state(b"on"), None);
+    }
+
+    #[tokio::test]
+    async fn a_discovered_entity_owns_its_nested_legacy_looking_topic() {
+        let (ctx, _eventloop) = test_ctx(false, 4);
+        ctx.lights.write().await.insert(
+            "desk".to_string(),
+            light_config(&["lights/bedroom/ceiling/state"], None),
+            "homeassistant/light/desk/config",
+        );
+        ctx.state.write().await.lights.insert(
+            "desk".to_string(),
+            LightView {
+                name: "Desk".to_string(),
+                on: false,
+            },
+        );
+
+        let owned = handle_light_state(&ctx, "lights/bedroom/ceiling/state", b"ON").await;
+
+        assert!(owned, "a registered entity claims the topic");
+        assert!(ctx.state.read().await.lights["desk"].on);
+    }
+
+    #[tokio::test]
+    async fn an_unregistered_topic_is_not_owned_by_any_entity() {
+        let (ctx, _eventloop) = test_ctx(false, 4);
+
+        let owned = handle_light_state(&ctx, "lights/lamp/state", b"ON").await;
+
+        assert!(!owned, "the legacy fallback must handle this topic");
+        assert!(ctx.state.read().await.lights.is_empty());
     }
 
     #[test]
