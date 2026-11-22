@@ -630,6 +630,46 @@ fn expand_topic(base: Option<&str>, topic: &str) -> String {
     }
 }
 
+/// Wait for a termination signal. Service managers and containers stop a
+/// process with SIGTERM, which `ctrl_c()` alone does not catch, and the default
+/// SIGTERM action ends the process before any cleanup can run. Where the
+/// platform has it, race SIGTERM against Ctrl-C so both paths shut down
+/// gracefully.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            // Keep the other signal (if any) alive rather than resolving early.
+            warn!(error = %e, "failed to listen for Ctrl-C");
+            std::future::pending::<()>().await;
+        }
+    };
+
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let terminate = async {
+            match signal(SignalKind::terminate()) {
+                Ok(mut sig) => {
+                    sig.recv().await;
+                }
+                Err(e) => {
+                    warn!(error = %e, "failed to listen for SIGTERM");
+                    std::future::pending::<()>().await;
+                }
+            }
+        };
+
+        tokio::select! {
+            _ = ctrl_c => {}
+            _ = terminate => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    ctrl_c.await;
+}
+
 /// Stop discovery on every adapter on the way out. BlueZ remembers an active
 /// scan per client, so a clean exit avoids leaving a stale scan behind for the
 /// next start. Best effort: this runs while shutting down, so errors are
@@ -920,7 +960,7 @@ async fn main() {
     });
 
     // Scan BLE directly for BTHome service data (UUID 0xFCD2).
-    tokio::spawn(ble_scanner(ctx.clone()));
+    let ble_handle = tokio::spawn(ble_scanner(ctx.clone()));
 
     // Background MQTT listener with automatic reconnect
     let bg_ctx = ctx.clone();
@@ -1092,18 +1132,18 @@ async fn main() {
         }
     };
     info!(%bind_addr, "HTTP server listening");
-    let shutdown = async {
-        if let Err(e) = tokio::signal::ctrl_c().await {
-            warn!(error = %e, "failed to listen for shutdown signal");
-        }
-    };
     if let Err(e) = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
+        .with_graceful_shutdown(shutdown_signal())
         .await
     {
         error!(error = %e, "HTTP server failed");
     }
 
+    // Stop the supervisor before clearing scans, otherwise a restart could
+    // re-arm discovery in the window between the two. Awaiting the aborted
+    // handle guarantees the task is gone and no longer holds an adapter.
+    ble_handle.abort();
+    let _ = ble_handle.await;
     stop_ble_scans().await;
     info!("shutting down");
 }
