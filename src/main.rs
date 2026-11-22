@@ -141,9 +141,11 @@ async fn main() {
         .route("/api/lights/:id/toggle", post(http::toggle_light))
         .with_state(ctx);
 
-    // Bind on all interfaces by default; set BIND_ADDR=127.0.0.1:8082 to sit
-    // behind a reverse proxy, or to run a second instance on another port.
-    let bind_addr = env_or("BIND_ADDR", "0.0.0.0:8082");
+    // Bind on all interfaces by default; set HA_LITE_HOST=127.0.0.1 to sit
+    // behind a reverse proxy, or HA_LITE_PORT to run a second instance.
+    let listen_host = env_or("HA_LITE_HOST", "0.0.0.0");
+    let listen_port: u16 = env_or("HA_LITE_PORT", "8082").parse().unwrap_or(8082);
+    let bind_addr = format!("{listen_host}:{listen_port}");
 
     let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
         Ok(listener) => listener,
