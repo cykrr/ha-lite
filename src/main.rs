@@ -1574,7 +1574,6 @@ async fn get_state(State(ctx): State<Arc<AppContext>>) -> Json<HomeState> {
 
 async fn toggle_light(Path(id): Path<String>, State(ctx): State<Arc<AppContext>>) -> StatusCode {
     let cfg = ctx.lights.read().await.by_id.get(&id).cloned();
-    let discovered = cfg.is_some();
 
     // Fall back to the legacy `lights/<id>/set` convention.
     let (topic, payload_on, payload_off) = match cfg {
@@ -1586,34 +1585,28 @@ async fn toggle_light(Path(id): Path<String>, State(ctx): State<Arc<AppContext>>
         ),
     };
 
-    // Unknown ids are a client error whether or not the broker is up, so they
-    // still get a 404 instead of a misleading gateway error, and a stale tab
-    // can't create a ghost switch in the UI.
-    if !discovered && !ctx.state.read().await.lights.contains_key(&id) {
-        debug!(%id, "ignoring toggle for unknown light");
-        return StatusCode::NOT_FOUND;
-    }
-
-    // `publish` only reports a closed request channel, not a dead broker: it
-    // would keep returning Ok while disconnected and then block once the
-    // 32-slot queue filled. Check the session flag first, so an offline broker
-    // fails fast and the optimistic flip is never made.
-    if !ctx.mqtt_connected.load(Ordering::Relaxed) {
-        warn!(%id, "MQTT broker is not connected; rejecting light command");
-        return StatusCode::BAD_GATEWAY;
-    }
-
-    // Decide the target *and* record it under one write lock. Two rapid
-    // requests therefore alternate ON/OFF instead of both reading the same
-    // stale value and publishing the same command.
+    // Decide the target *and* record it under one write lock, and look the
+    // light up without creating it: `forget_lights` may have removed it since
+    // the registry read above, and an `entry().or_insert_with()` would then
+    // resurrect it with a fallback name. Two rapid requests therefore
+    // alternate ON/OFF instead of both reading the same stale value.
     let (optimistic_on, payload) = {
         let mut state = ctx.state.write().await;
-        let name = state
-            .lights
-            .get(&id)
-            .map(|light| light.name.clone())
-            .unwrap_or_else(|| id.clone());
-        flip_light(&mut state, &id, &name, &payload_on, &payload_off)
+        let Some(light) = state.lights.get_mut(&id) else {
+            debug!(%id, "ignoring toggle for unknown light");
+            return StatusCode::NOT_FOUND;
+        };
+
+        // `publish` only reports a closed request channel, not a dead broker:
+        // it would keep returning Ok while disconnected and then block once
+        // the 32-slot queue filled. Check the session flag before flipping, so
+        // an offline broker fails fast and no optimistic state is written.
+        if !ctx.mqtt_connected.load(Ordering::Relaxed) {
+            warn!(%id, "MQTT broker is not connected; rejecting light command");
+            return StatusCode::BAD_GATEWAY;
+        }
+
+        flip_light(light, &payload_on, &payload_off)
     };
 
     // `try_publish` never waits for the event loop: if the 32-slot request
@@ -1637,23 +1630,11 @@ async fn toggle_light(Path(id): Path<String>, State(ctx): State<Arc<AppContext>>
     }
 }
 
-/// Flip a light inside a single mutable borrow and return the new state plus
-/// the command payload. Keeping the read and the write together is what makes
-/// concurrent toggles serialize instead of racing.
-fn flip_light(
-    state: &mut HomeState,
-    id: &str,
-    name: &str,
-    payload_on: &str,
-    payload_off: &str,
-) -> (bool, String) {
-    let light = state
-        .lights
-        .entry(id.to_string())
-        .or_insert_with(|| LightView {
-            name: name.to_string(),
-            on: false,
-        });
+/// Flip a light that the caller has already looked up and return the new state
+/// plus the command payload. Taking the view rather than the whole state means
+/// a toggle can never insert an entity, so it can't resurrect one that
+/// discovery removed concurrently.
+fn flip_light(light: &mut LightView, payload_on: &str, payload_off: &str) -> (bool, String) {
     light.on = !light.on;
     let payload = if light.on { payload_on } else { payload_off };
     (light.on, payload.to_string())
@@ -2149,28 +2130,35 @@ mod tests {
 
     #[test]
     fn rapid_toggles_alternate_payloads() {
-        let mut state = HomeState::default();
+        let mut light = LightView {
+            name: "lamp".to_string(),
+            on: false,
+        };
 
         assert_eq!(
-            flip_light(&mut state, "lamp", "lamp", "ON", "OFF"),
+            flip_light(&mut light, "ON", "OFF"),
             (true, "ON".to_string())
         );
         assert_eq!(
-            flip_light(&mut state, "lamp", "lamp", "ON", "OFF"),
+            flip_light(&mut light, "ON", "OFF"),
             (false, "OFF".to_string())
         );
-        assert_eq!(
-            flip_light(&mut state, "lamp", "lamp", "1", "0"),
-            (true, "1".to_string())
-        );
-        assert!(state.lights["lamp"].on);
+        assert_eq!(flip_light(&mut light, "1", "0"), (true, "1".to_string()));
+        assert!(light.on);
     }
 
     #[test]
     fn failed_publish_reverts_optimistic_flip() {
         let mut state = HomeState::default();
+        state.lights.insert(
+            "lamp".to_string(),
+            LightView {
+                name: "lamp".to_string(),
+                on: false,
+            },
+        );
 
-        let (optimistic_on, _) = flip_light(&mut state, "lamp", "lamp", "ON", "OFF");
+        let (optimistic_on, _) = flip_light(state.lights.get_mut("lamp").unwrap(), "ON", "OFF");
         assert!(optimistic_on);
         revert_flip(&mut state, "lamp", optimistic_on);
 
@@ -2178,19 +2166,29 @@ mod tests {
     }
 
     #[test]
-    fn a_new_light_view_uses_the_assigned_name() {
-        let mut state = HomeState::default();
+    fn toggling_preserves_the_registered_name() {
+        let mut light = LightView {
+            name: "Tasmota Left".to_string(),
+            on: false,
+        };
 
-        flip_light(&mut state, "tasmota_x_1", "Tasmota Left", "ON", "OFF");
+        flip_light(&mut light, "ON", "OFF");
 
-        assert_eq!(state.lights["tasmota_x_1"].name, "Tasmota Left");
+        assert_eq!(light.name, "Tasmota Left");
     }
 
     #[test]
     fn revert_does_not_clobber_a_newer_state_update() {
         let mut state = HomeState::default();
+        state.lights.insert(
+            "lamp".to_string(),
+            LightView {
+                name: "lamp".to_string(),
+                on: false,
+            },
+        );
 
-        let (optimistic_on, _) = flip_light(&mut state, "lamp", "lamp", "ON", "OFF");
+        let (optimistic_on, _) = flip_light(state.lights.get_mut("lamp").unwrap(), "ON", "OFF");
         assert!(optimistic_on);
 
         // The device reported OFF between our flip and the failed publish.
