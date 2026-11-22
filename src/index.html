@@ -69,7 +69,10 @@
       }
     }
     async function toggle(id) {
-      await fetch(`/api/lights/${encodeURIComponent(id)}/toggle`, { method: 'POST' });
+      await fetch(`/api/lights/${encodeURIComponent(id)}/toggle`, {
+        method: 'POST',
+        headers: { 'X-Requested-With': 'ha-lite' },
+      });
       setTimeout(refresh, 150);
     }
     setInterval(refresh, 2000);

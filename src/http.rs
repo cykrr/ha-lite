@@ -4,13 +4,19 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     Json,
 };
 use tracing::{debug, warn};
 
 use crate::app::AppContext;
 use crate::lights::{flip_light, revert_flip};
+
+/// A non-simple header that HTML forms cannot set. Requiring it makes a
+/// cross-origin POST fail its CORS preflight, so a random web page on the LAN
+/// cannot toggle lights just by submitting a form to this server.
+const TOGGLE_HEADER: &str = "x-requested-with";
+const TOGGLE_HEADER_VALUE: &str = "ha-lite";
 
 pub(crate) async fn get_state(State(ctx): State<Arc<AppContext>>) -> Json<crate::app::HomeState> {
     Json(ctx.state.read().await.clone())
@@ -19,7 +25,17 @@ pub(crate) async fn get_state(State(ctx): State<Arc<AppContext>>) -> Json<crate:
 pub(crate) async fn toggle_light(
     Path(id): Path<String>,
     State(ctx): State<Arc<AppContext>>,
+    headers: HeaderMap,
 ) -> StatusCode {
+    if headers
+        .get(TOGGLE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        != Some(TOGGLE_HEADER_VALUE)
+    {
+        debug!(%id, "rejecting toggle without the ha-lite request header");
+        return StatusCode::FORBIDDEN;
+    }
+
     let cfg = ctx.lights.read().await.by_id.get(&id).cloned();
 
     // Fall back to the legacy `lights/<id>/set` convention.
@@ -81,6 +97,35 @@ pub(crate) async fn toggle_light(
 mod tests {
     use super::*;
     use crate::app::{test_ctx, LightView};
+    use axum::http::HeaderValue;
+
+    fn toggle_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-requested-with", HeaderValue::from_static("ha-lite"));
+        headers
+    }
+
+    #[tokio::test]
+    async fn a_toggle_without_the_custom_header_is_forbidden() {
+        let (ctx, _eventloop, _requests) = test_ctx(true, 4);
+        ctx.state.write().await.lights.insert(
+            "lamp".to_string(),
+            LightView {
+                name: "Lamp".to_string(),
+                on: false,
+            },
+        );
+
+        let status = toggle_light(
+            Path("lamp".to_string()),
+            State(ctx.clone()),
+            HeaderMap::new(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(!ctx.state.read().await.lights["lamp"].on);
+    }
 
     #[tokio::test]
     async fn offline_toggle_is_rejected_without_flipping() {
@@ -93,7 +138,12 @@ mod tests {
             },
         );
 
-        let status = toggle_light(Path("lamp".to_string()), State(ctx.clone())).await;
+        let status = toggle_light(
+            Path("lamp".to_string()),
+            State(ctx.clone()),
+            toggle_headers(),
+        )
+        .await;
 
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert!(!ctx.state.read().await.lights["lamp"].on);
@@ -103,7 +153,12 @@ mod tests {
     async fn unknown_light_is_404_even_while_offline() {
         let (ctx, _eventloop, _requests) = test_ctx(false, 4);
 
-        let status = toggle_light(Path("ghost".to_string()), State(ctx.clone())).await;
+        let status = toggle_light(
+            Path("ghost".to_string()),
+            State(ctx.clone()),
+            toggle_headers(),
+        )
+        .await;
 
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert!(ctx.state.read().await.lights.is_empty());
@@ -130,9 +185,17 @@ mod tests {
             )
             .expect("first publish fits");
 
-        let status = toggle_light(Path("lamp".to_string()), State(ctx.clone())).await;
+        let status = toggle_light(
+            Path("lamp".to_string()),
+            State(ctx.clone()),
+            toggle_headers(),
+        )
+        .await;
 
         assert_eq!(status, StatusCode::BAD_GATEWAY);
-        assert!(!ctx.state.read().await.lights["lamp"].on, "flip must be undone");
+        assert!(
+            !ctx.state.read().await.lights["lamp"].on,
+            "flip must be undone"
+        );
     }
 }

@@ -78,7 +78,7 @@ scan.
 | --- | --- | --- |
 | `GET` | `/` | Minimal web UI |
 | `GET` | `/api/state` | Sensors and lights as JSON |
-| `POST` | `/api/lights/:id/toggle` | Toggle one discovered light |
+| `POST` | `/api/lights/:id/toggle` | Toggle one discovered light (requires `X-Requested-With: ha-lite`) |
 
 `GET /api/state` returns:
 
@@ -102,8 +102,16 @@ scan.
 `sensors` is keyed by MQTT topic or BLE address. The top-level `temp_c` and
 `humidity` mirror the most recent report across all sensors.
 
-The toggle endpoint returns `204` on success, `404` for an unknown light, and
+The toggle endpoint returns `204` on success, `403` when the
+`X-Requested-With: ha-lite` header is missing, `404` for an unknown light, and
 `502` when the broker is disconnected or the command could not be queued.
+Requiring a non-safelisted header forces cross-origin requests through a CORS
+preflight, which blocks drive-by LAN form/fetch CSRF.
+
+```sh
+curl -X POST -H 'X-Requested-With: ha-lite' \
+  http://localhost:8082/api/lights/desk/toggle
+```
 
 ## MQTT topics
 
