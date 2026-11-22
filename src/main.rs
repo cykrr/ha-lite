@@ -1178,7 +1178,15 @@ fn tasmota_entities(mac: &str, cfg: &TasmotaDiscovery) -> Vec<TasmotaEntity> {
             .unwrap_or(default_prefixes[i])
     };
 
-    let short_id = &mac[mac.len().saturating_sub(6)..];
+    // `mac` is taken raw from an MQTT topic, which is arbitrary UTF-8. Slice
+    // on a character boundary so a malformed topic cannot panic the MQTT task;
+    // six characters is the same result as six bytes for a real hex MAC.
+    let short_id = mac
+        .char_indices()
+        .rev()
+        .nth(5)
+        .map(|(start, _)| &mac[start..])
+        .unwrap_or(mac);
     let base = |prefix: &str| {
         full_topic
             .replace("%prefix%", prefix)
@@ -1545,6 +1553,23 @@ mod tests {
             entity.config.request_topic.as_deref(),
             Some("cmnd/tasmota_73673C/STATE")
         );
+    }
+
+    #[test]
+    fn non_ascii_tasmota_mac_does_not_panic() {
+        // Topics are arbitrary UTF-8. In `a😀bcdef` the byte at `len - 6`
+        // falls inside the emoji, so byte slicing used to panic and take the
+        // MQTT task down with it.
+        let payload = r#"{
+            "dn":"Weird","fn":[],"t":"dev","ft":"%prefix%/%topic%/%id%/",
+            "tp":["cmnd","stat","tele"],"rl":[1]
+        }"#;
+
+        let cfg: TasmotaDiscovery = serde_json::from_str(payload).unwrap();
+        let entities = tasmota_entities("a😀bcdef", &cfg);
+
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].config.command_topic, "cmnd/dev/😀bcdef/POWER");
     }
 
     #[test]
