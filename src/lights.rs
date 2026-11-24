@@ -41,9 +41,16 @@ impl LightConfig {
     }
 }
 
+/// An entity and the discovery topic that announced it. Keeping them in one
+/// value means the two can't disagree about which topic owns an entity.
+struct Entry {
+    config: LightConfig,
+    discovery_topic: String,
+}
+
 #[derive(Default)]
 pub(crate) struct LightRegistry {
-    pub(crate) by_id: HashMap<String, LightConfig>,
+    by_id: HashMap<String, Entry>,
     /// Several entities can share a state topic: every channel of a
     /// multi-relay Tasmota device is driven by the same `.../RESULT` and
     /// `.../STATE` topics, each reading its own `POWERn` JSON key.
@@ -104,7 +111,7 @@ impl LightRegistry {
             .collect();
 
         let mut freed_topics = Vec::new();
-        let previous_topics = self.by_id.get(&id).map(|c| c.state_topics.clone());
+        let previous_topics = self.by_id.get(&id).map(|e| e.config.state_topics.clone());
         if let Some(previous_topics) = previous_topics {
             for topic in previous_topics {
                 if !config.state_topics.contains(&topic)
@@ -117,14 +124,8 @@ impl LightRegistry {
 
         // The same entity may be re-announced on a different discovery topic
         // (HA node id changes), so forget the old announcement.
-        let previous_discovery_topics: Vec<String> = self
-            .by_discovery_topic
-            .iter()
-            .filter(|(_, ids)| ids.contains(&id))
-            .map(|(topic, _)| topic.clone())
-            .collect();
-        for topic in previous_discovery_topics {
-            unindex(&mut self.by_discovery_topic, &topic, &id);
+        if let Some(entry) = self.by_id.get(&id) {
+            unindex(&mut self.by_discovery_topic, &entry.discovery_topic, &id);
         }
 
         for topic in &config.state_topics {
@@ -139,11 +140,23 @@ impl LightRegistry {
             .insert(id.clone());
         self.seen_discovery.insert(discovery_topic.to_string());
 
+        let entry = Entry {
+            config,
+            discovery_topic: discovery_topic.to_string(),
+        };
         Registration {
-            is_new: self.by_id.insert(id, config).is_none(),
+            is_new: self.by_id.insert(id, entry).is_none(),
             new_topics,
             freed_topics,
         }
+    }
+
+    pub(crate) fn get(&self, id: &str) -> Option<&LightConfig> {
+        self.by_id.get(id).map(|entry| &entry.config)
+    }
+
+    pub(crate) fn configs(&self) -> impl Iterator<Item = &LightConfig> {
+        self.by_id.values().map(|entry| &entry.config)
     }
 
     /// Remove entities by id, forgetting both indexes. Returns the ids that
@@ -153,22 +166,11 @@ impl LightRegistry {
         let mut freed_topics = Vec::new();
 
         for id in ids {
-            // An entity normally has exactly one discovery topic, but clear
-            // every index entry rather than assuming that.
-            let indexed_topics: Vec<String> = self
-                .by_discovery_topic
-                .iter()
-                .filter(|(_, ids)| ids.contains(&id))
-                .map(|(topic, _)| topic.clone())
-                .collect();
-            for topic in indexed_topics {
-                unindex(&mut self.by_discovery_topic, &topic, &id);
-            }
-
-            let Some(config) = self.by_id.remove(&id) else {
+            let Some(entry) = self.by_id.remove(&id) else {
                 continue;
             };
-            for topic in &config.state_topics {
+            unindex(&mut self.by_discovery_topic, &entry.discovery_topic, &id);
+            for topic in &entry.config.state_topics {
                 if unindex(&mut self.by_state_topic, topic, &id) {
                     freed_topics.push(topic.clone());
                 }
@@ -319,7 +321,7 @@ pub(crate) async fn handle_light_state(ctx: &Arc<AppContext>, topic: &str, paylo
         let reg = ctx.lights.read().await;
         reg.ids_for_topic(topic)
             .into_iter()
-            .filter_map(|id| reg.by_id.get(&id).map(|cfg| (id, cfg.clone())))
+            .filter_map(|id| reg.get(&id).map(|cfg| (id, cfg.clone())))
             .collect()
     };
 
@@ -630,7 +632,7 @@ mod tests {
         assert_eq!(removed, vec!["tasmota_MAC_2"]);
         assert!(freed_topics.is_empty(), "channel 1 still owns the topic");
         assert_eq!(reg.ids_for_topic("stat/t/RESULT"), vec!["tasmota_MAC_1"]);
-        assert!(!reg.by_id.contains_key("tasmota_MAC_2"));
+        assert!(reg.get("tasmota_MAC_2").is_none());
     }
 
     #[test]
@@ -706,7 +708,7 @@ mod tests {
 
         assert_eq!(removed, vec!["tasmota_MAC_1", "tasmota_MAC_2"]);
         assert_eq!(freed, vec!["stat/t/RESULT"]);
-        assert!(reg.by_id.contains_key("other"));
+        assert!(reg.get("other").is_some());
         assert_eq!(reg.ids_for_topic("stat/other/state"), vec!["other"]);
         assert!(reg.ids_for_topic("stat/t/RESULT").is_empty());
     }
@@ -723,12 +725,36 @@ mod tests {
         let (removed, freed) = reg.remove_by_discovery_topic("homeassistant/switch/gone/config");
         assert!(removed.is_empty());
         assert!(freed.is_empty());
-        assert_eq!(reg.by_id.len(), 1);
+        assert_eq!(reg.configs().count(), 1);
 
         // The still-announced entity is untouched.
         let (removed, _) = reg.remove_by_discovery_topic("homeassistant/switch/other/config");
         assert_eq!(removed, vec!["other"]);
-        assert!(reg.by_id.is_empty());
+        assert!(reg.configs().next().is_none());
+    }
+
+    #[test]
+    fn re_announcing_an_entity_on_a_new_topic_moves_its_ownership() {
+        let mut reg = LightRegistry::default();
+        reg.insert(
+            "desk".to_string(),
+            light_config(&["stat/desk"], None),
+            "homeassistant/switch/old/config",
+        );
+        reg.insert(
+            "desk".to_string(),
+            light_config(&["stat/desk"], None),
+            "homeassistant/switch/new/config",
+        );
+
+        let (removed, _) = reg.remove_by_discovery_topic("homeassistant/switch/old/config");
+        assert!(removed.is_empty(), "the old topic no longer owns the entity");
+        assert!(reg.get("desk").is_some());
+
+        let (removed, freed) = reg.remove_by_discovery_topic("homeassistant/switch/new/config");
+        assert_eq!(removed, vec!["desk"]);
+        assert_eq!(freed, vec!["stat/desk"]);
+        assert!(reg.get("desk").is_none());
     }
 
     #[test]

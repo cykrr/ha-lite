@@ -76,7 +76,7 @@ async fn command_light(
         return StatusCode::FORBIDDEN;
     }
 
-    let cfg = ctx.lights.read().await.by_id.get(&id).cloned();
+    let cfg = ctx.lights.read().await.get(&id).cloned();
 
     // Fall back to the legacy `lights/<id>/set` convention.
     let (topic, payload_on, payload_off) = match cfg {

@@ -115,6 +115,22 @@ async fn main() -> ExitCode {
         )
         .init();
 
+    // Bind before starting anything else, so a port that is already taken fails
+    // fast without having touched BlueZ or the broker. Bind on all interfaces by
+    // default; set HA_LITE_HOST=127.0.0.1 to sit behind a reverse proxy, or
+    // HA_LITE_PORT to run a second instance.
+    let listen_host = env_or("HA_LITE_HOST", "0.0.0.0");
+    let listen_port: u16 = env_or("HA_LITE_PORT", "8082").parse().unwrap_or(8082);
+    let bind_addr = format!("{listen_host}:{listen_port}");
+
+    let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            error!(error = %e, %bind_addr, "failed to bind HTTP listener; exiting");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let host = env_or("MQTT_HOST", "127.0.0.1");
     let port: u16 = env_or("MQTT_PORT", "1883").parse().unwrap_or(1883);
     let user = std::env::var("MQTT_USER").unwrap_or_default();
@@ -196,19 +212,6 @@ async fn main() -> ExitCode {
         .route("/api/lights/:id/off", post(http::turn_off))
         .with_state(ctx.clone());
 
-    // Bind on all interfaces by default; set HA_LITE_HOST=127.0.0.1 to sit
-    // behind a reverse proxy, or HA_LITE_PORT to run a second instance.
-    let listen_host = env_or("HA_LITE_HOST", "0.0.0.0");
-    let listen_port: u16 = env_or("HA_LITE_PORT", "8082").parse().unwrap_or(8082);
-    let bind_addr = format!("{listen_host}:{listen_port}");
-
-    let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
-        Ok(listener) => listener,
-        Err(e) => {
-            error!(error = %e, %bind_addr, "failed to bind HTTP listener; exiting");
-            return ExitCode::FAILURE;
-        }
-    };
     info!(%bind_addr, "HTTP server listening");
     if let Err(e) = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal(ctx.clone()))

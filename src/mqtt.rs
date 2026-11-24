@@ -48,6 +48,8 @@ pub(crate) fn client_id() -> String {
     let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
         .ok()
         .or_else(|| std::env::var("HOSTNAME").ok())
+        // Windows has neither of the above.
+        .or_else(|| std::env::var("COMPUTERNAME").ok())
         .unwrap_or_default();
 
     derive_client_id(&host)
@@ -347,7 +349,7 @@ async fn on_connected(ctx: &Arc<AppContext>) {
     // of a multi-relay device share the same RESULT/STATE topics.
     let configs: Vec<LightConfig> = {
         let reg = ctx.lights.read().await;
-        reg.by_id.values().cloned().collect()
+        reg.configs().cloned().collect()
     };
     let state_topics: HashSet<&str> = configs
         .iter()
@@ -514,7 +516,7 @@ mod tests {
         .await;
 
         assert_eq!(
-            ctx.lights.read().await.by_id["desk"].command_topic,
+            ctx.lights.read().await.get("desk").unwrap().command_topic,
             "cmnd/desk/POWER"
         );
         assert!(ctx.state.read().await.lights.contains_key("desk"));
@@ -554,8 +556,8 @@ mod tests {
         handle_publish(&ctx, "homeassistant/switch/desk/config", desk).await;
         sweep_stale_discovery(&ctx, session).await;
 
-        assert!(ctx.lights.read().await.by_id.contains_key("desk"));
-        assert!(!ctx.lights.read().await.by_id.contains_key("lamp"));
+        assert!(ctx.lights.read().await.get("desk").is_some());
+        assert!(ctx.lights.read().await.get("lamp").is_none());
         assert!(ctx.state.read().await.lights.contains_key("desk"));
         assert!(!ctx.state.read().await.lights.contains_key("lamp"));
     }
@@ -574,13 +576,13 @@ mod tests {
         let old = ctx.lights.write().await.begin_session();
         ctx.lights.write().await.begin_session();
         sweep_stale_discovery(&ctx, old).await;
-        assert!(ctx.lights.read().await.by_id.contains_key("desk"));
+        assert!(ctx.lights.read().await.get("desk").is_some());
 
         // The link dropped mid-replay, so "unseen" is not trustworthy yet.
         let current = ctx.lights.write().await.begin_session();
         ctx.mqtt.set_connected(false);
         sweep_stale_discovery(&ctx, current).await;
-        assert!(ctx.lights.read().await.by_id.contains_key("desk"));
+        assert!(ctx.lights.read().await.get("desk").is_some());
     }
 
     #[tokio::test]
@@ -595,8 +597,7 @@ mod tests {
         .await;
 
         let reg = ctx.lights.read().await;
-        assert!(reg.by_id.contains_key("tasmota_AABBCCDDEEFF_1"), "{:?}", reg.by_id.keys());
-        assert_eq!(reg.by_id["tasmota_AABBCCDDEEFF_1"].command_topic, "cmnd/shelf/POWER");
+        assert_eq!(reg.get("tasmota_AABBCCDDEEFF_1").unwrap().command_topic, "cmnd/shelf/POWER");
     }
 
     #[tokio::test]
@@ -611,7 +612,7 @@ mod tests {
         handle_publish(&ctx, topic, b"").await;
 
         assert!(!ctx.state.read().await.lights.contains_key("desk"));
-        assert!(ctx.lights.read().await.by_id.is_empty());
+        assert!(ctx.lights.read().await.configs().next().is_none());
     }
 
     #[tokio::test]
