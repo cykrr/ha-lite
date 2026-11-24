@@ -140,17 +140,21 @@ async fn main() {
     info!("waiting for BTHome broadcasts (MQTT sensors/# and local BLE)");
     let watch_ctx = ctx.clone();
     tokio::spawn(async move {
+        // A box with only lights never gets a broadcast, so back the warning
+        // off (1m, 2m, 4m ... capped at 1h) instead of nagging every minute.
         let mut waited_secs = 0u64;
+        let mut interval_secs = 60u64;
         loop {
-            tokio::time::sleep(Duration::from_secs(60)).await;
+            tokio::time::sleep(Duration::from_secs(interval_secs)).await;
             if watch_ctx.bthome_packets.load(Ordering::Relaxed) > 0 {
                 break;
             }
-            waited_secs += 60;
+            waited_secs += interval_secs;
             warn!(
                 waited_secs,
                 "no BTHome broadcasts received yet (MQTT sensors/# or local BLE)"
             );
+            interval_secs = (interval_secs * 2).min(3600);
         }
     });
 
