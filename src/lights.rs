@@ -339,8 +339,10 @@ pub(crate) async fn handle_light_state(ctx: &Arc<AppContext>, topic: &str, paylo
         match serde_json::from_str::<serde_json::Value>(raw) {
             Ok(json) => Some(json),
             Err(e) => {
+                // Keyed entities skip a non-JSON payload (no JSON to read), but
+                // a raw entity sharing the topic must still see it.
                 debug!(error = %e, topic, payload = raw, "light state is not JSON");
-                return true;
+                None
             }
         }
     } else {
@@ -466,6 +468,39 @@ mod tests {
 
         assert!(owned, "a registered entity claims the topic");
         assert!(ctx.state.read().await.lights["desk"].on);
+    }
+
+    #[tokio::test]
+    async fn a_raw_entity_still_sees_a_non_json_payload_on_a_shared_topic() {
+        let (ctx, _eventloop, _requests) = test_ctx(false, 4);
+        {
+            let mut reg = ctx.lights.write().await;
+            reg.insert(
+                "json".to_string(),
+                light_config(&["shared/state"], Some("POWER1")),
+                "homeassistant/switch/json/config",
+            );
+            reg.insert(
+                "raw".to_string(),
+                light_config(&["shared/state"], None),
+                "homeassistant/switch/raw/config",
+            );
+        }
+        for id in ["json", "raw"] {
+            ctx.state.write().await.lights.insert(
+                id.to_string(),
+                LightView {
+                    name: id.to_string(),
+                    on: false,
+                },
+            );
+        }
+
+        handle_light_state(&ctx, "shared/state", b"ON").await;
+
+        let state = ctx.state.read().await;
+        assert!(state.lights["raw"].on, "the raw entity must apply the payload");
+        assert!(!state.lights["json"].on, "the keyed entity has no JSON to read");
     }
 
     #[tokio::test]
