@@ -51,6 +51,13 @@ pub(crate) struct LightRegistry {
     /// Discovery topic that announced each entity, so an empty retained config
     /// removes exactly the entities it created.
     by_discovery_topic: HashMap<String, HashSet<String>>,
+    /// Counts MQTT sessions, so a delayed sweep can tell it belongs to an
+    /// older connection and must not run.
+    session: u64,
+    /// Discovery topics (re)announced on the current session. The broker replays
+    /// every retained config after a reconnect, so anything still missing once
+    /// the replay settles was deleted while we were offline.
+    seen_discovery: HashSet<String>,
 }
 
 /// Drop `id` from a topic index, removing the topic once nobody owns it.
@@ -130,6 +137,7 @@ impl LightRegistry {
             .entry(discovery_topic.to_string())
             .or_default()
             .insert(id.clone());
+        self.seen_discovery.insert(discovery_topic.to_string());
 
         Registration {
             is_new: self.by_id.insert(id, config).is_none(),
@@ -203,6 +211,34 @@ impl LightRegistry {
             })
             .unwrap_or_default();
         self.remove_ids(stale)
+    }
+
+    /// Start tracking a new MQTT session and return its number. Discovery that
+    /// the broker replays from now on counts as seen.
+    pub(crate) fn begin_session(&mut self) -> u64 {
+        self.session += 1;
+        self.seen_discovery.clear();
+        self.session
+    }
+
+    /// Remove entities whose discovery topic was not re-announced on `session`.
+    /// Returns `None` when a newer session has started since, which makes the
+    /// caller's view of "seen" stale.
+    pub(crate) fn sweep_unseen(
+        &mut self,
+        session: u64,
+    ) -> Option<(Vec<String>, Vec<String>)> {
+        if session != self.session {
+            return None;
+        }
+
+        let stale: Vec<String> = self
+            .by_discovery_topic
+            .iter()
+            .filter(|(topic, _)| !self.seen_discovery.contains(*topic))
+            .flat_map(|(_, ids)| ids.iter().cloned())
+            .collect();
+        Some(self.remove_ids(stale))
     }
 
     /// Every entity whose state may be carried by this topic.

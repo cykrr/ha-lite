@@ -17,7 +17,9 @@ use tracing::{debug, info, warn};
 use crate::app::{AppContext, LightView};
 use crate::bthome::{bthome_bytes, process_bthome};
 use crate::discovery::{handle_discovery, handle_tasmota_discovery};
-use crate::lights::{handle_light_state, legacy_light_id, legacy_light_state, LightConfig};
+use crate::lights::{
+    forget_lights, handle_light_state, legacy_light_id, legacy_light_state, LightConfig,
+};
 
 /// How often the watchdog samples the event-loop heartbeat.
 const WATCHDOG_INTERVAL: Duration = Duration::from_secs(20);
@@ -25,6 +27,10 @@ const WATCHDOG_INTERVAL: Duration = Duration::from_secs(20);
 /// event loop beats at least every reconnect backoff (30s) plus connect timeout
 /// (5s), so five idle samples (100s) mean it is genuinely stuck.
 const WATCHDOG_STALL_LIMIT: u32 = 5;
+
+/// How long after a (re)connect the retained discovery replay is given to
+/// finish before lights it did not mention are treated as deleted.
+const DISCOVERY_SWEEP_DELAY: Duration = Duration::from_secs(30);
 
 /// MQTT client id sent on CONNECT.
 ///
@@ -319,6 +325,7 @@ async fn on_connected(ctx: &Arc<AppContext>) {
     info!("connected to MQTT broker");
     ctx.mqtt.set_connected(true);
     ctx.mqtt.reset_requested_state();
+    let session = ctx.lights.write().await.begin_session();
     for (topic, qos) in [
         ("sensors/#", QoS::AtMostOnce),
         ("lights/+/state", QoS::AtLeastOnce),
@@ -351,6 +358,35 @@ async fn on_connected(ctx: &Arc<AppContext>) {
             ctx.mqtt.request_state(topic);
         }
     }
+
+    // A config cleared while we were offline is never replayed, so nothing
+    // would ever remove its light. Once the retained replay has had time to
+    // arrive, drop whatever it did not mention.
+    let ctx = ctx.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(DISCOVERY_SWEEP_DELAY).await;
+        sweep_stale_discovery(&ctx, session).await;
+    });
+}
+
+/// Remove lights whose discovery config the broker did not replay on `session`.
+/// Skipped when the link has dropped or a newer session has begun: the replay
+/// is then incomplete, and sweeping would delete live lights.
+async fn sweep_stale_discovery(ctx: &Arc<AppContext>, session: u64) {
+    if !ctx.mqtt.is_connected() {
+        return;
+    }
+
+    let swept = ctx.lights.write().await.sweep_unseen(session);
+    let Some((removed, freed_topics)) = swept else {
+        return;
+    };
+    if removed.is_empty() {
+        return;
+    }
+
+    forget_lights(ctx, &removed, freed_topics).await;
+    info!(ids = ?removed, "removed light(s) whose discovery config is gone from the broker");
 }
 
 /// Dispatch one broker message by topic. Discovery is handled first; any other
@@ -490,6 +526,49 @@ mod tests {
             commands.contains(&"subscribe stat/desk/POWER".to_string()),
             "{commands:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_light_deleted_while_offline_is_swept_after_reconnect() {
+        let (ctx, _eventloop, _requests) = test_ctx(true, 16);
+        let desk = br#"{"name":"Desk","uniq_id":"desk","stat_t":"stat/desk/POWER","cmd_t":"cmnd/desk/POWER"}"#;
+        let lamp = br#"{"name":"Lamp","uniq_id":"lamp","stat_t":"stat/lamp/POWER","cmd_t":"cmnd/lamp/POWER"}"#;
+        handle_publish(&ctx, "homeassistant/switch/desk/config", desk).await;
+        handle_publish(&ctx, "homeassistant/switch/lamp/config", lamp).await;
+
+        // Reconnect: the broker replays the desk config but the lamp's was
+        // cleared while we were away, so nothing ever mentions it.
+        let session = ctx.lights.write().await.begin_session();
+        handle_publish(&ctx, "homeassistant/switch/desk/config", desk).await;
+        sweep_stale_discovery(&ctx, session).await;
+
+        assert!(ctx.lights.read().await.by_id.contains_key("desk"));
+        assert!(!ctx.lights.read().await.by_id.contains_key("lamp"));
+        assert!(ctx.state.read().await.lights.contains_key("desk"));
+        assert!(!ctx.state.read().await.lights.contains_key("lamp"));
+    }
+
+    #[tokio::test]
+    async fn a_stale_or_disconnected_sweep_removes_nothing() {
+        let (ctx, _eventloop, _requests) = test_ctx(true, 16);
+        handle_publish(
+            &ctx,
+            "homeassistant/switch/desk/config",
+            br#"{"name":"Desk","uniq_id":"desk","stat_t":"stat/desk/POWER","cmd_t":"cmnd/desk/POWER"}"#,
+        )
+        .await;
+
+        // A newer session has started, so the older sweep must not run.
+        let old = ctx.lights.write().await.begin_session();
+        ctx.lights.write().await.begin_session();
+        sweep_stale_discovery(&ctx, old).await;
+        assert!(ctx.lights.read().await.by_id.contains_key("desk"));
+
+        // The link dropped mid-replay, so "unseen" is not trustworthy yet.
+        let current = ctx.lights.write().await.begin_session();
+        ctx.mqtt.set_connected(false);
+        sweep_stale_discovery(&ctx, current).await;
+        assert!(ctx.lights.read().await.by_id.contains_key("desk"));
     }
 
     #[tokio::test]
