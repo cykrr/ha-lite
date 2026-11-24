@@ -271,7 +271,16 @@ pub(crate) async fn process_bthome(
 /// Proxies usually send a hex string, sometimes with a trailing newline; raw
 /// BTHome bytes are accepted too. Whitespace is ignored for hex text only, so
 /// it can't corrupt a raw packet that happens to contain 0x20/0x0a.
+///
+/// The two forms can be told apart by the first byte. A raw v2 packet starts
+/// with 0x40..=0x5F (0x44 for trigger packets is the ASCII hex digit `D`), but
+/// the hex text of any v2 packet starts with `4` or `5` (0x34/0x35), so a
+/// payload that already looks like a v2 header is never hex text.
 pub(crate) fn bthome_bytes(payload: &[u8]) -> Vec<u8> {
+    if payload.first().is_some_and(|b| b & 0xE0 == 0x40) {
+        return payload.to_vec();
+    }
+
     if let Ok(text) = std::str::from_utf8(payload) {
         let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
         if !compact.is_empty() && compact.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -350,6 +359,15 @@ mod tests {
     #[test]
     fn raw_bthome_bytes_are_not_mistaken_for_hex_text() {
         let raw = [0x40, 0x00, 0xcb, 0x0c, 0x2b, 0x0b, 0x10, 0x00, 0x11, 0x01];
+        assert_eq!(bthome_bytes(&raw), raw.to_vec());
+    }
+
+    #[test]
+    fn raw_trigger_packet_made_of_hex_digit_bytes_stays_raw() {
+        // 0x44 is ASCII `D`; with every other byte also a hex digit the whole
+        // packet reads as even-length hex text.
+        let raw: [u8; 4] = [0x44, 0x30, 0x31, 0x32];
+        assert!(raw.iter().all(|b| b.is_ascii_hexdigit()));
         assert_eq!(bthome_bytes(&raw), raw.to_vec());
     }
 
