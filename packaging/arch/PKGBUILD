@@ -18,9 +18,9 @@ source=("$_pkgname::git+$url.git"
         'ha-lite.sysusers'
         'ha-lite.env')
 sha256sums=('SKIP'
-            '2124becb55223f1bc2169177cfa6888d350ba019d2dcaa1a7ce8ce74d1b70582'
+            '9a93564fb414865335ec0dcc6fcc057207567afb7ce597e19a93c7f25523a063'
             '5b88a59401dfef28d9bb2c460eaae9360189c2b272c77f17a0c8cf1742ce4be1'
-            '9e081943a9f005864378033b7761ba0fa47fdf5fe3eb6b2fe899721902a580b4')
+            '4a1cb6bec214e153b909d4eb1944efc2e0d5c8e68f62327b3b1933d6af499fc0')
 
 pkgver() {
   cd "$_pkgname"
