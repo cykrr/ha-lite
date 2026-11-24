@@ -17,7 +17,7 @@ MQTT broker and it starts discovering.
 - Tasmota discovery (`tasmota/discovery/<MAC>/config`), including multi-relay
   devices.
 - Legacy `lights/<id>/state` and `lights/<id>/set` topic convention.
-- Optimistic light toggles that revert if the MQTT publish fails.
+- Optimistic light commands that revert if the MQTT publish fails.
 - Reconnects to the broker and to BLE adapters with backoff.
 - Small built-in HTML UI and a JSON state endpoint.
 
@@ -80,7 +80,9 @@ scan.
 | --- | --- | --- |
 | `GET` | `/` | Minimal web UI |
 | `GET` | `/api/state` | Sensors and lights as JSON |
-| `POST` | `/api/lights/:id/toggle` | Toggle one discovered light (requires `X-Requested-With: ha-lite`) |
+| `POST` | `/api/lights/:id/on` | Turn one light on; idempotent (requires `X-Requested-With: ha-lite`) |
+| `POST` | `/api/lights/:id/off` | Turn one light off; idempotent (same header) |
+| `POST` | `/api/lights/:id/toggle` | Flip one light; a retry flips it back, so prefer `on`/`off` (same header) |
 
 `GET /api/state` returns:
 
@@ -104,7 +106,7 @@ scan.
 `sensors` is keyed by MQTT topic or BLE address. The top-level `temp_c` and
 `humidity` mirror the most recent report across all sensors.
 
-The toggle endpoint returns `204` on success, `403` when the
+The `on`, `off` and `toggle` endpoints return `204` on success, `403` when the
 `X-Requested-With: ha-lite` header is missing, `404` for an unknown light, and
 `502` when the broker is disconnected or the command could not be queued.
 Requiring a non-safelisted header forces cross-origin requests through a CORS
@@ -112,7 +114,7 @@ preflight, which blocks drive-by LAN form/fetch CSRF.
 
 ```sh
 curl -X POST -H 'X-Requested-With: ha-lite' \
-  http://localhost:8082/api/lights/desk/toggle
+  http://localhost:8082/api/lights/desk/on
 ```
 
 ## MQTT topics
@@ -129,7 +131,7 @@ Subscribed:
 
 Published:
 
-- The discovered entity's `cmd_t` topic when the UI or API toggles it.
+- The discovered entity's `cmd_t` topic when the UI or API switches it.
 - `lights/<id>/set` for a light known only through the legacy convention.
 - An empty payload to OpenBeken `.../get` topics and Tasmota
   `cmnd/<topic>/STATE` topics to request the initial state.

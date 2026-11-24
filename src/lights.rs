@@ -394,22 +394,51 @@ pub(crate) fn legacy_light_state(payload: &[u8]) -> Option<bool> {
     }
 }
 
-/// Flip a light that the caller has already looked up and return the new state
-/// plus the command payload. Taking the view rather than the whole state means
-/// a toggle can never insert an entity, so it can't resurrect one that
-/// discovery removed concurrently.
-pub(crate) fn flip_light(light: &mut LightView, payload_on: &str, payload_off: &str) -> (bool, String) {
-    light.on = !light.on;
-    let payload = if light.on { payload_on } else { payload_off };
-    (light.on, payload.to_string())
+/// What a client asked a light to do. `Set` names the target state, so
+/// repeating it (a retry, a double tap, two clients) converges instead of
+/// flipping back and forth; `Toggle` flips whatever state is held.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Command {
+    Toggle,
+    Set(bool),
 }
 
-/// Undo an optimistic flip after a failed publish, but only while the light
+/// The optimistic change a command made, kept so a failed publish can undo it.
+pub(crate) struct Applied {
+    pub(crate) previous: bool,
+    pub(crate) on: bool,
+    pub(crate) payload: String,
+}
+
+/// Apply a command to a light that the caller has already looked up and return
+/// the change plus the payload to publish. Taking the view rather than the
+/// whole state means a command can never insert an entity, so it can't
+/// resurrect one that discovery removed concurrently.
+pub(crate) fn apply_command(
+    light: &mut LightView,
+    command: Command,
+    payload_on: &str,
+    payload_off: &str,
+) -> Applied {
+    let previous = light.on;
+    light.on = match command {
+        Command::Toggle => !previous,
+        Command::Set(on) => on,
+    };
+    let payload = if light.on { payload_on } else { payload_off };
+    Applied {
+        previous,
+        on: light.on,
+        payload: payload.to_string(),
+    }
+}
+
+/// Undo an optimistic change after a failed publish, but only while the light
 /// still holds our value: a real state update may have superseded it.
-pub(crate) fn revert_flip(state: &mut HomeState, id: &str, expected_on: bool) {
+pub(crate) fn revert_command(state: &mut HomeState, id: &str, applied: &Applied) {
     if let Some(light) = state.lights.get_mut(id) {
-        if light.on == expected_on {
-            light.on = !expected_on;
+        if light.on == applied.on {
+            light.on = applied.previous;
         }
     }
 }
@@ -709,16 +738,53 @@ mod tests {
             on: false,
         };
 
-        assert_eq!(
-            flip_light(&mut light, "ON", "OFF"),
-            (true, "ON".to_string())
-        );
-        assert_eq!(
-            flip_light(&mut light, "ON", "OFF"),
-            (false, "OFF".to_string())
-        );
-        assert_eq!(flip_light(&mut light, "1", "0"), (true, "1".to_string()));
+        let first = apply_command(&mut light, Command::Toggle, "ON", "OFF");
+        assert_eq!((first.on, first.payload.as_str()), (true, "ON"));
+        let second = apply_command(&mut light, Command::Toggle, "ON", "OFF");
+        assert_eq!((second.on, second.payload.as_str()), (false, "OFF"));
+        let third = apply_command(&mut light, Command::Toggle, "1", "0");
+        assert_eq!((third.on, third.payload.as_str()), (true, "1"));
         assert!(light.on);
+    }
+
+    #[test]
+    fn setting_an_explicit_state_is_idempotent() {
+        let mut light = LightView {
+            name: "lamp".to_string(),
+            on: false,
+        };
+
+        for _ in 0..3 {
+            let applied = apply_command(&mut light, Command::Set(true), "ON", "OFF");
+            assert_eq!((applied.on, applied.payload.as_str()), (true, "ON"));
+        }
+        assert!(light.on);
+
+        let applied = apply_command(&mut light, Command::Set(false), "ON", "OFF");
+        assert_eq!((applied.on, applied.payload.as_str()), (false, "OFF"));
+        assert!(!light.on);
+    }
+
+    #[test]
+    fn reverting_a_no_op_set_keeps_the_light_on() {
+        let mut state = HomeState::default();
+        state.lights.insert(
+            "lamp".to_string(),
+            LightView {
+                name: "lamp".to_string(),
+                on: true,
+            },
+        );
+
+        let applied = apply_command(
+            state.lights.get_mut("lamp").unwrap(),
+            Command::Set(true),
+            "ON",
+            "OFF",
+        );
+        revert_command(&mut state, "lamp", &applied);
+
+        assert!(state.lights["lamp"].on, "previous state was already on");
     }
 
     #[test]
@@ -732,9 +798,14 @@ mod tests {
             },
         );
 
-        let (optimistic_on, _) = flip_light(state.lights.get_mut("lamp").unwrap(), "ON", "OFF");
-        assert!(optimistic_on);
-        revert_flip(&mut state, "lamp", optimistic_on);
+        let applied = apply_command(
+            state.lights.get_mut("lamp").unwrap(),
+            Command::Toggle,
+            "ON",
+            "OFF",
+        );
+        assert!(applied.on);
+        revert_command(&mut state, "lamp", &applied);
 
         assert!(!state.lights["lamp"].on);
     }
@@ -746,7 +817,7 @@ mod tests {
             on: false,
         };
 
-        flip_light(&mut light, "ON", "OFF");
+        apply_command(&mut light, Command::Toggle, "ON", "OFF");
 
         assert_eq!(light.name, "Tasmota Left");
     }
@@ -762,12 +833,17 @@ mod tests {
             },
         );
 
-        let (optimistic_on, _) = flip_light(state.lights.get_mut("lamp").unwrap(), "ON", "OFF");
-        assert!(optimistic_on);
+        let applied = apply_command(
+            state.lights.get_mut("lamp").unwrap(),
+            Command::Toggle,
+            "ON",
+            "OFF",
+        );
+        assert!(applied.on);
 
         // The device reported OFF between our flip and the failed publish.
         state.lights.get_mut("lamp").unwrap().on = false;
-        revert_flip(&mut state, "lamp", optimistic_on);
+        revert_command(&mut state, "lamp", &applied);
 
         assert!(!state.lights["lamp"].on, "authoritative state must win");
     }

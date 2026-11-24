@@ -64,12 +64,14 @@
       for (const [id, light] of Object.entries(data.lights)) {
         const btn = document.createElement('button');
         btn.textContent = `${light.name}: ${light.on ? 'ON' : 'OFF'}`;
-        btn.addEventListener('click', () => toggle(id));
+        // Send the state this button is asking for, not "flip": a double tap or
+        // a second client then converges instead of undoing the first command.
+        btn.addEventListener('click', () => setLight(id, !light.on));
         container.appendChild(btn);
       }
     }
-    async function toggle(id) {
-      await fetch(`/api/lights/${encodeURIComponent(id)}/toggle`, {
+    async function setLight(id, on) {
+      await fetch(`/api/lights/${encodeURIComponent(id)}/${on ? 'on' : 'off'}`, {
         method: 'POST',
         headers: { 'X-Requested-With': 'ha-lite' },
       });

@@ -192,6 +192,8 @@ async fn main() -> ExitCode {
         .route("/", get(|| async { Html(include_str!("index.html")) }))
         .route("/api/state", get(http::get_state))
         .route("/api/lights/:id/toggle", post(http::toggle_light))
+        .route("/api/lights/:id/on", post(http::turn_on))
+        .route("/api/lights/:id/off", post(http::turn_off))
         .with_state(ctx.clone());
 
     // Bind on all interfaces by default; set HA_LITE_HOST=127.0.0.1 to sit
