@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
-    Json,
+    http::{header, HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
 };
 use tracing::{debug, warn};
 
@@ -18,8 +18,19 @@ use crate::lights::{apply_command, revert_command, Command};
 const TOGGLE_HEADER: &str = "x-requested-with";
 const TOGGLE_HEADER_VALUE: &str = "ha-lite";
 
-pub(crate) async fn get_state(State(ctx): State<Arc<AppContext>>) -> Json<crate::app::HomeState> {
-    Json(ctx.state.read().await.clone())
+pub(crate) async fn get_state(State(ctx): State<Arc<AppContext>>) -> Response {
+    // Serialize under the read guard instead of cloning the whole state first:
+    // the UI polls this, and a clone copies every sensor and light name just to
+    // throw the copy away. `Json` can't borrow the guard, because it serializes
+    // after the handler returns, so build the body here.
+    let body = serde_json::to_vec(&*ctx.state.read().await);
+    match body {
+        Ok(body) => ([(header::CONTENT_TYPE, "application/json")], body).into_response(),
+        Err(e) => {
+            warn!(error = %e, "failed to serialize state");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 /// Flip a light. Prefer [`turn_on`] / [`turn_off`]: a toggle acts on whatever
@@ -141,6 +152,26 @@ mod tests {
             name: "Lamp".to_string(),
             on,
         }
+    }
+
+    #[tokio::test]
+    async fn state_is_served_as_json_matching_the_held_state() {
+        let (ctx, _eventloop, _requests) = test_ctx(false, 4);
+        ctx.state.write().await.lights.insert("lamp".to_string(), lamp(true));
+
+        let response = get_state(State(ctx.clone())).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["lights"]["lamp"]["on"], true);
+        assert_eq!(json["lights"]["lamp"]["name"], "Lamp");
     }
 
     #[tokio::test]
