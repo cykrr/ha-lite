@@ -4,7 +4,7 @@
 use std::{
     collections::HashSet,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -18,6 +18,56 @@ use crate::app::{AppContext, LightView};
 use crate::bthome::{bthome_bytes, process_bthome};
 use crate::discovery::{handle_discovery, handle_tasmota_discovery};
 use crate::lights::{handle_light_state, legacy_light_id, legacy_light_state, LightConfig};
+
+/// How often the watchdog samples the event-loop heartbeat.
+const WATCHDOG_INTERVAL: Duration = Duration::from_secs(20);
+/// Consecutive samples without a heartbeat before the process gives up. The
+/// event loop beats at least every reconnect backoff (30s) plus connect timeout
+/// (5s), so five idle samples (100s) mean it is genuinely stuck.
+const WATCHDOG_STALL_LIMIT: u32 = 5;
+
+/// MQTT client id sent on CONNECT.
+///
+/// The broker keys sessions by this id, and this app connects with a clean
+/// session, so two instances sharing an id evict each other every time either
+/// one reconnects. Default to a per-host id; `MQTT_CLIENT_ID` pins it when a
+/// deployment needs a stable name.
+pub(crate) fn client_id() -> String {
+    if let Ok(id) = std::env::var("MQTT_CLIENT_ID") {
+        if !id.is_empty() {
+            return id;
+        }
+    }
+
+    let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .unwrap_or_default();
+
+    derive_client_id(&host)
+}
+
+/// Build the default id from a hostname. MQTT 3.1.1 allows 23 bytes and only
+/// alphanumerics plus `-`/`_`, so anything else becomes `-` and the result is
+/// truncated.
+fn derive_client_id(host: &str) -> String {
+    let host = host.trim();
+    if host.is_empty() {
+        return "ha-lite".to_string();
+    }
+
+    let mut id = String::from("ha-lite-");
+    id.extend(host.chars().map(|c| {
+        if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+            c
+        } else {
+            '-'
+        }
+    }));
+    // Every character is ASCII after the mapping, so this is a char boundary.
+    id.truncate(23);
+    id
+}
 
 /// One outbound MQTT request queued for the request worker.
 pub(crate) enum MqttCommand {
@@ -42,6 +92,10 @@ pub(crate) struct MqttLink {
     /// toggle consults this flag instead of assuming success while the broker
     /// is unreachable.
     connected: AtomicBool,
+    /// Incremented once per event-loop iteration. The watchdog compares it
+    /// across samples to tell a live-but-disconnected loop from a wedged one:
+    /// `connected` alone cannot distinguish the two.
+    eventloop_polls: AtomicU64,
     /// State topics already asked for a snapshot on this MQTT connection, so
     /// the reconnect re-arm and the retained discovery replay don't both ask.
     requested_state: Mutex<HashSet<String>>,
@@ -55,6 +109,7 @@ impl MqttLink {
                 client,
                 requests,
                 connected: AtomicBool::new(false),
+                eventloop_polls: AtomicU64::new(0),
                 requested_state: Mutex::new(HashSet::new()),
             },
             request_rx,
@@ -67,6 +122,14 @@ impl MqttLink {
 
     pub(crate) fn set_connected(&self, connected: bool) {
         self.connected.store(connected, Ordering::Relaxed);
+    }
+
+    fn beat(&self) {
+        self.eventloop_polls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn polls(&self) -> u64 {
+        self.eventloop_polls.load(Ordering::Relaxed)
     }
 
     fn send(&self, request: MqttCommand) {
@@ -174,6 +237,7 @@ pub(crate) async fn run_event_loop(ctx: Arc<AppContext>, mut eventloop: rumqttc:
     let mut backoff = Duration::from_secs(1);
 
     loop {
+        ctx.mqtt.beat();
         match eventloop.poll().await {
             Ok(event) => {
                 if handle_event(&ctx, event).await {
@@ -192,6 +256,44 @@ pub(crate) async fn run_event_loop(ctx: Arc<AppContext>, mut eventloop: rumqttc:
                 backoff = (backoff * 2).min(Duration::from_secs(30));
             }
         }
+    }
+}
+
+/// Exit when the MQTT event loop stops making progress.
+///
+/// The event loop is a spawned task, so a panic in it (or a future that never
+/// returns) leaves the process itself running: HTTP keeps answering `/api/state`
+/// but every toggle fails with 502 until someone restarts it by hand. Exiting
+/// hands recovery to the service manager instead (`Restart=on-failure`).
+pub(crate) async fn watch_event_loop(ctx: Arc<AppContext>) {
+    let mut previous = ctx.mqtt.polls();
+    let mut stalled = 0u32;
+
+    loop {
+        tokio::time::sleep(WATCHDOG_INTERVAL).await;
+        let current = ctx.mqtt.polls();
+        let (next_stalled, give_up) = stall_check(previous, current, stalled);
+        previous = current;
+        stalled = next_stalled;
+
+        if give_up {
+            tracing::error!(
+                stalled_secs = WATCHDOG_INTERVAL.as_secs() * WATCHDOG_STALL_LIMIT as u64,
+                "MQTT event loop stopped making progress; exiting so the service manager restarts it"
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Fold one heartbeat sample into the watchdog state. Returns the new run of
+/// idle samples and whether that run is long enough to give up.
+fn stall_check(previous: u64, current: u64, stalled: u32) -> (u32, bool) {
+    if current == previous {
+        let stalled = stalled.saturating_add(1);
+        (stalled, stalled >= WATCHDOG_STALL_LIMIT)
+    } else {
+        (0, false)
     }
 }
 
@@ -255,6 +357,8 @@ async fn on_connected(ctx: &Arc<AppContext>) {
 /// topic is either a sensor feed, a discovered light's state topic, or the
 /// legacy `lights/<id>/state` convention.
 pub(crate) async fn handle_publish(ctx: &Arc<AppContext>, topic: &str, payload: &[u8]) {
+    debug!(%topic, len = payload.len(), "MQTT message");
+
     if let Some(mac) = topic.strip_prefix("tasmota/discovery/") {
         if let Some(mac) = mac.strip_suffix("/config") {
             handle_tasmota_discovery(ctx, topic, mac, payload).await;
@@ -474,5 +578,50 @@ mod tests {
         let sensor = &state.sensors["sensors/bthome1"];
         assert_eq!(sensor.temp_c, Some(28.32));
         assert_eq!(sensor.humidity, Some(40.16));
+    }
+
+    #[test]
+    fn watchdog_needs_a_full_idle_window_before_giving_up() {
+        let mut stalled = 0;
+        for _ in 0..WATCHDOG_STALL_LIMIT - 1 {
+            let (next, give_up) = stall_check(7, 7, stalled);
+            stalled = next;
+            assert!(!give_up, "must not exit before the window is full");
+        }
+
+        let (_, give_up) = stall_check(7, 7, stalled);
+        assert!(give_up, "a full idle window means the loop is stuck");
+    }
+
+    #[test]
+    fn a_heartbeat_resets_the_watchdog() {
+        let (stalled, give_up) = stall_check(8, 9, WATCHDOG_STALL_LIMIT);
+        assert_eq!(stalled, 0);
+        assert!(!give_up);
+    }
+
+    #[tokio::test]
+    async fn the_event_loop_heartbeat_is_observable() {
+        let (ctx, _eventloop, _requests) = test_ctx(false, 4);
+        let before = ctx.mqtt.polls();
+
+        ctx.mqtt.beat();
+
+        assert_eq!(ctx.mqtt.polls(), before + 1);
+    }
+
+    #[test]
+    fn client_id_defaults_to_a_hostname_suffix() {
+        assert_eq!(derive_client_id("alarm\n"), "ha-lite-alarm");
+        assert_eq!(derive_client_id(""), "ha-lite");
+        assert_eq!(derive_client_id("a.b c"), "ha-lite-a-b-c");
+    }
+
+    #[test]
+    fn client_id_fits_the_mqtt_limit() {
+        let id = derive_client_id("a-very-long-hostname-that-keeps-going");
+
+        assert_eq!(id.len(), 23);
+        assert!(id.starts_with("ha-lite-"));
     }
 }

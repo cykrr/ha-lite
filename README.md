@@ -41,6 +41,7 @@ file in the working directory. Real environment variables win over `.env`.
 | `MQTT_PORT` | `1883` | MQTT broker port |
 | `MQTT_USER` | empty | Broker username; omitted when empty |
 | `MQTT_PASSWORD` | empty | Broker password |
+| `MQTT_CLIENT_ID` | `ha-lite-<hostname>` | Broker client id; set it when running more than one instance, so they don't evict each other |
 | `HA_LITE_HOST` | `0.0.0.0` | HTTP bind address |
 | `HA_LITE_PORT` | `8082` | HTTP port |
 | `RUST_LOG` | `info` | `tracing` filter, for example `debug` |
@@ -52,6 +53,7 @@ MQTT_HOST=192.168.100.3
 MQTT_PORT=1883
 MQTT_USER=krr
 MQTT_PASSWORD=change-me
+# MQTT_CLIENT_ID=ha-lite-alarm
 
 HA_LITE_HOST=0.0.0.0
 HA_LITE_PORT=8082

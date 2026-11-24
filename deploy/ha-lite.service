@@ -11,6 +11,9 @@ Group=ha-lite
 SupplementaryGroups=bluetooth
 WorkingDirectory=/opt/ha-lite
 EnvironmentFile=-/etc/ha-lite/ha-lite.env
+# Journal the panic message and a backtrace if a task ever dies; the process
+# then exits so Restart=on-failure can bring it back cleanly.
+Environment=RUST_BACKTRACE=1
 ExecStart=/opt/ha-lite/ha-lite
 Restart=on-failure
 RestartSec=5s

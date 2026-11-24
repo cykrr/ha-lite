@@ -38,6 +38,22 @@ fn env_or(key: &str, default: &str) -> String {
         .unwrap_or_else(|| default.to_string())
 }
 
+/// Leave a restart to the service manager when any task panics.
+///
+/// A panic in a spawned task (the MQTT event loop, the BLE scanner) only kills
+/// that task; the process keeps running and the HTTP API still answers, so the
+/// UI looks alive while every toggle fails. The default hook still prints the
+/// panic and, with `RUST_BACKTRACE=1`, a backtrace to stderr (the journal under
+/// systemd); exiting afterwards lets `Restart=on-failure` start a clean
+/// instance instead of leaving a half-dead one.
+fn exit_on_panic() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+        std::process::exit(1);
+    }));
+}
+
 /// Wait for a termination signal. Service managers and containers stop a
 /// process with SIGTERM, which `ctrl_c()` alone does not catch, and the default
 /// SIGTERM action ends the process before any cleanup can run. Where the
@@ -80,6 +96,8 @@ async fn shutdown_signal() {
 
 #[tokio::main]
 async fn main() {
+    exit_on_panic();
+
     // Load .env before the subscriber so RUST_LOG can be set there too.
     let _ = dotenv::dotenv();
 
@@ -94,10 +112,17 @@ async fn main() {
     let port: u16 = env_or("MQTT_PORT", "1883").parse().unwrap_or(1883);
     let user = std::env::var("MQTT_USER").unwrap_or_default();
     let password = std::env::var("MQTT_PASSWORD").unwrap_or_default();
+    let client_id = mqtt::client_id();
 
-    info!(%host, port, authenticated = !user.is_empty(), "connecting to MQTT broker");
+    info!(
+        %host,
+        port,
+        %client_id,
+        authenticated = !user.is_empty(),
+        "connecting to MQTT broker"
+    );
 
-    let mut mqttoptions = MqttOptions::new("ha-lite", &host, port);
+    let mut mqttoptions = MqttOptions::new(client_id, &host, port);
     mqttoptions.set_keep_alive(Duration::from_secs(15));
     if !user.is_empty() {
         mqttoptions.set_credentials(user, password);
@@ -134,6 +159,10 @@ async fn main() {
 
     // Background MQTT listener with automatic reconnect.
     tokio::spawn(mqtt::run_event_loop(ctx.clone(), eventloop));
+
+    // If that listener ever stops making progress, leave a restart to systemd
+    // instead of serving 502s forever from a half-dead process.
+    tokio::spawn(mqtt::watch_event_loop(ctx.clone()));
 
     let app = Router::new()
         .route("/", get(|| async { Html(include_str!("index.html")) }))
