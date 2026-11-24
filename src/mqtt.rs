@@ -412,29 +412,23 @@ pub(crate) async fn handle_publish(ctx: &Arc<AppContext>, topic: &str, payload: 
         return;
     }
 
-    if topic.starts_with("sensors/") {
-        if topic.starts_with("sensors/bthome") {
-            ctx.bthome_packets.fetch_add(1, Ordering::Relaxed);
+    // Only claim the BTHome feed. Any other `sensors/...` topic falls through,
+    // so a discovered light whose `stat_t` lives there still gets its state.
+    if topic.starts_with("sensors/bthome") {
+        ctx.bthome_packets.fetch_add(1, Ordering::Relaxed);
 
-            // Proxies usually send a hex string (e.g. "4002ca0903bf13"),
-            // but accept raw BTHome bytes too.
-            let bytes = bthome_bytes(payload);
+        // Proxies usually send a hex string (e.g. "4002ca0903bf13"),
+        // but accept raw BTHome bytes too.
+        let bytes = bthome_bytes(payload);
 
-            debug!(
-                %topic,
-                len = bytes.len(),
-                hex = %hex::encode(&bytes),
-                "BTHome broadcast received"
-            );
+        debug!(
+            %topic,
+            len = bytes.len(),
+            hex = %hex::encode(&bytes),
+            "BTHome broadcast received"
+        );
 
-            process_bthome(ctx, "MQTT", topic, &bytes).await;
-        } else {
-            debug!(
-                %topic,
-                payload = %String::from_utf8_lossy(payload),
-                "unhandled sensor topic"
-            );
-        }
+        process_bthome(ctx, "MQTT", topic, &bytes).await;
     } else if !handle_light_state(ctx, topic, payload).await {
         // Legacy convention: `lights/<id>/state` with ON/OFF payloads.
         // Discovered entities get first claim on the topic, and only a
@@ -526,6 +520,21 @@ mod tests {
             commands.contains(&"subscribe stat/desk/POWER".to_string()),
             "{commands:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_light_state_topic_under_sensors_is_not_swallowed() {
+        let (ctx, _eventloop, _requests) = test_ctx(true, 8);
+        handle_publish(
+            &ctx,
+            "homeassistant/switch/fan/config",
+            br#"{"name":"Fan","uniq_id":"fan","stat_t":"sensors/fan/state","cmd_t":"cmnd/fan/POWER","pl_on":"ON","pl_off":"OFF"}"#,
+        )
+        .await;
+
+        handle_publish(&ctx, "sensors/fan/state", b"ON").await;
+
+        assert!(ctx.state.read().await.lights["fan"].on);
     }
 
     #[tokio::test]
