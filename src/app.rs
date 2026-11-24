@@ -57,6 +57,9 @@ pub(crate) struct AppContext {
     pub(crate) mqtt: MqttLink,
 }
 
+/// Most distinct sensor sources kept in `HomeState::sensors`.
+const MAX_SENSORS: usize = 64;
+
 /// Record one sensor update under its source identity (BLE address or MQTT
 /// topic). Metrics missing from this packet keep their previous value.
 pub(crate) fn record_sensor(
@@ -68,6 +71,20 @@ pub(crate) fn record_sensor(
 ) {
     if t.is_none() && h.is_none() {
         return;
+    }
+
+    // Anything in radio range can advertise BTHome, so cap the map: once it is
+    // full, a new source displaces the least recently seen one. Real sensors
+    // re-announce every few seconds and reappear on their next packet.
+    if state.sensors.len() >= MAX_SENSORS && !state.sensors.contains_key(source) {
+        let stalest = state
+            .sensors
+            .iter()
+            .min_by_key(|(_, sensor)| sensor.last_seen)
+            .map(|(key, _)| key.clone());
+        if let Some(key) = stalest {
+            state.sensors.remove(&key);
+        }
     }
 
     let sensor = state
@@ -159,6 +176,23 @@ mod tests {
         assert_eq!(state.sensors["sensor"].temp_c, Some(27.5));
         assert_eq!(state.sensors["sensor"].humidity, Some(43.1));
         assert_eq!(state.sensors["sensor"].last_seen, 200);
+    }
+
+    #[test]
+    fn sensor_map_is_capped_and_drops_the_stalest_source() {
+        let mut state = HomeState::default();
+
+        for i in 0..MAX_SENSORS {
+            record_sensor(&mut state, &format!("s{i}"), Some(20.0), None, 100 + i as u64);
+        }
+        // Refresh the oldest entry, so the next-oldest becomes the stalest.
+        record_sensor(&mut state, "s0", Some(21.0), None, 1000);
+        record_sensor(&mut state, "new", Some(22.0), None, 1001);
+
+        assert_eq!(state.sensors.len(), MAX_SENSORS);
+        assert!(state.sensors.contains_key("s0"));
+        assert!(state.sensors.contains_key("new"));
+        assert!(!state.sensors.contains_key("s1"));
     }
 
     #[test]
