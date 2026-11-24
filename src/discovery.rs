@@ -277,7 +277,10 @@ fn tasmota_entities(mac: &str, cfg: &TasmotaDiscovery) -> Vec<TasmotaEntity> {
         .enumerate()
         .filter(|(_, kind)| *kind == 1 || *kind == 2)
         .collect();
-    let multiple = channels.len() > 1;
+    // `rl` is indexed by power slot, and slots held by lights or shutters are
+    // filtered out above. A lone relay in a later slot is still `POWER<n>`,
+    // so number by slot whenever any channel sits past the first one.
+    let multiple = channels.len() > 1 || channels.iter().any(|(idx, _)| *idx > 0);
 
     // Tasmota's `state` is [off, on, toggle, hold].
     let payload_off = cfg.state.first().cloned().unwrap_or_else(|| "OFF".to_string());
@@ -476,5 +479,21 @@ mod tests {
                 .unwrap();
             assert_eq!(on, entity.config.state_key.as_deref() == Some("POWER1"));
         }
+    }
+
+    #[test]
+    fn a_lone_relay_in_a_later_slot_keeps_its_slot_number() {
+        let payload = r#"{
+            "dn":"Dev","fn":[null,null],"t":"tasmota_test","ft":"%prefix%/%topic%/",
+            "tp":["cmnd","stat","tele"],"rl":[0,1,0,0]
+        }"#;
+
+        let cfg: TasmotaDiscovery = serde_json::from_str(payload).unwrap();
+        let entities = tasmota_entities("AABBCCDDEEFF", &cfg);
+
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].id, "tasmota_AABBCCDDEEFF_2");
+        assert_eq!(entities[0].config.command_topic, "cmnd/tasmota_test/POWER2");
+        assert_eq!(entities[0].config.state_key.as_deref(), Some("POWER2"));
     }
 }
