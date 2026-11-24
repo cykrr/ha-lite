@@ -165,29 +165,28 @@ async fn scan_adapter(
             continue;
         };
 
+        // Most advertisements in range are not BTHome; skip them before
+        // paying for a BlueZ lookup.
+        let Some(data) = service_data.get(&bthome_uuid) else {
+            continue;
+        };
+
         let address = adapter
             .peripheral(&id)
             .await
             .map(|p| p.address().to_string())
             .unwrap_or_else(|_| format!("{id:?}"));
 
-        for (uuid, data) in service_data {
-            if uuid != bthome_uuid {
-                debug!(%address, %uuid, hex = %hex::encode(&data), "BLE service data");
-                continue;
-            }
+        ctx.bthome_packets.fetch_add(1, Ordering::Relaxed);
+        debug!(
+            %address,
+            hex = %hex::encode(data),
+            "BLE BTHome advertisement"
+        );
 
-            ctx.bthome_packets.fetch_add(1, Ordering::Relaxed);
-            debug!(
-                %address,
-                hex = %hex::encode(&data),
-                "BLE BTHome advertisement"
-            );
-
-            // Advertisements are already raw bytes; only the MQTT feed needs
-            // hex detection.
-            process_bthome(&ctx, "BLE", &address, &data).await;
-        }
+        // Advertisements are already raw bytes; only the MQTT feed needs
+        // hex detection.
+        process_bthome(&ctx, "BLE", &address, data).await;
     }
 
     Ok(())
