@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use tracing::{info, warn};
+use tracing::{debug, warn};
 
 use crate::app::{record_sensor, unix_secs, AppContext};
 
@@ -55,9 +55,11 @@ pub(crate) struct BthomeReading {
     pub(crate) value: f64,
 }
 
-/// BTHome v2 object table (sensor + binary sensor + device info).
-/// Variable-length objects (text/raw/events) are intentionally absent; the
-/// decoder stops when it hits one, as the spec requires for unknown ids.
+/// BTHome v2 object table (sensor + binary sensor + event + device info).
+/// Variable-length objects (text/raw) are intentionally absent; the decoder
+/// stops when it hits one, as the spec requires for unknown ids. Events are
+/// fixed length and must be listed: objects are sorted by id, so an event
+/// (0x3A/0x3C) comes before 0x45 temperature and would otherwise hide it.
 const BTHOME_OBJECTS: &[BthomeObject] = &[
     BthomeObject { id: 0x00, name: "packet_id", kind: BthomeKind::U8, factor: 1.0 },
     BthomeObject { id: 0x01, name: "battery", kind: BthomeKind::U8, factor: 1.0 },
@@ -107,6 +109,10 @@ const BTHOME_OBJECTS: &[BthomeObject] = &[
     BthomeObject { id: 0x2D, name: "window", kind: BthomeKind::U8, factor: 1.0 },
     BthomeObject { id: 0x2E, name: "humidity", kind: BthomeKind::U8, factor: 1.0 },
     BthomeObject { id: 0x2F, name: "moisture", kind: BthomeKind::U8, factor: 1.0 },
+    // Events: a button is one event-type byte, a dimmer an event type plus a
+    // step count (read as one little-endian value; only the length matters).
+    BthomeObject { id: 0x3A, name: "button", kind: BthomeKind::U8, factor: 1.0 },
+    BthomeObject { id: 0x3C, name: "dimmer", kind: BthomeKind::U16, factor: 1.0 },
     BthomeObject { id: 0x3D, name: "count", kind: BthomeKind::U16, factor: 1.0 },
     BthomeObject { id: 0x3E, name: "count", kind: BthomeKind::U32, factor: 1.0 },
     BthomeObject { id: 0x3F, name: "rotation", kind: BthomeKind::I16, factor: 0.1 },
@@ -230,12 +236,11 @@ pub(crate) async fn process_bthome(
     source: &str,
     bytes: &[u8],
 ) {
-    let hex_payload = hex::encode(bytes);
     let Some(readings) = decode_bthome(bytes) else {
         warn!(
             transport,
             source = %source,
-            hex = %hex_payload,
+            hex = %hex::encode(bytes),
             "BTHome payload is encrypted or not v2"
         );
         return;
@@ -245,14 +250,16 @@ pub(crate) async fn process_bthome(
         warn!(
             transport,
             source = %source,
-            hex = %hex_payload,
+            hex = %hex::encode(bytes),
             "BTHome payload had no supported objects"
         );
         return;
     }
 
     let (t, h) = bthome_temperature_humidity(&readings);
-    info!(
+    // Every sensor in range advertises every few seconds, so this is per-packet
+    // noise: keep it out of the journal at the default level.
+    debug!(
         transport,
         source = %source,
         objects = %summarize_bthome(&readings),
@@ -342,6 +349,21 @@ mod tests {
         let (t, h) = bthome_temperature_humidity(&readings);
         assert_eq!(t, Some(28.32));
         assert_eq!(h, Some(40.16));
+    }
+
+    #[test]
+    fn an_event_object_does_not_hide_the_temperature_after_it() {
+        // 00 pid, 3A button press, 45 temperature 30.0
+        let readings = decode("4000013a01452c01");
+        assert!(readings.iter().any(|r| r.name == "button"));
+        let (t, _) = bthome_temperature_humidity(&readings);
+        assert_eq!(t, Some(30.0));
+
+        // 3C dimmer: event type plus step count
+        let readings = decode("403c0103452c01");
+        assert!(readings.iter().any(|r| r.name == "dimmer"));
+        let (t, _) = bthome_temperature_humidity(&readings);
+        assert_eq!(t, Some(30.0));
     }
 
     #[test]
