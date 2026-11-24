@@ -1,82 +1,208 @@
 <!doctype html>
-<html>
+<html lang="en">
 <head>
+  <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
   <title>HA Lite</title>
   <style>
-    body { font-family: system-ui, sans-serif; max-width: 400px; margin: 2rem auto; padding: 0 1rem; }
-    button { width: 100%; padding: 1rem; margin: 0.5rem 0; font-size: 1.1rem; cursor: pointer; }
-    .sensor { padding: 0.5rem 0; border-bottom: 1px solid #ddd; }
-    .sensor .name { font-size: 0.8rem; color: #555; }
-    .sensor .values { font-size: 1.1rem; }
-    .empty { color: #777; font-style: italic; padding: 0.5rem 0; }
+    :root {
+      --bg: #f4f5f7;
+      --card: #fff;
+      --text: #1b1f24;
+      --muted: #667085;
+      --border: #e2e5ea;
+      --accent: #f5b301;
+      --accent-text: #201800;
+      --danger: #c62828;
+      --warn: #b26a00;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #111418;
+        --card: #1b2026;
+        --text: #e8eaed;
+        --muted: #9aa3ae;
+        --border: #2b323b;
+        --accent: #f5b301;
+        --accent-text: #201800;
+        --danger: #ef5350;
+        --warn: #ffb74d;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      max-width: 440px;
+      margin: 0 auto;
+      padding: 1.25rem 1rem 3rem;
+    }
+    header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 0.5rem; }
+    h1 { font-size: 1.25rem; margin: 0; }
+    h2 {
+      font-size: 0.75rem; font-weight: 600; letter-spacing: 0.08em;
+      text-transform: uppercase; color: var(--muted); margin: 1.5rem 0 0.5rem;
+    }
+    .status { font-size: 0.8rem; color: var(--muted); display: flex; align-items: center; gap: 0.4rem; }
+    .status::before {
+      content: ""; width: 0.55rem; height: 0.55rem; border-radius: 50%; background: #2e9d57;
+    }
+    .status.offline { color: var(--danger); }
+    .status.offline::before { background: var(--danger); }
+    .card {
+      background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+      padding: 0.75rem 1rem; margin-bottom: 0.6rem;
+    }
+    .sensor .name { font-size: 0.8rem; color: var(--muted); display: flex; justify-content: space-between; gap: 0.5rem; }
+    .sensor .name .age.stale { color: var(--warn); }
+    .sensor .values { font-size: 1.5rem; font-weight: 600; margin-top: 0.15rem; display: flex; gap: 1.25rem; flex-wrap: wrap; }
+    .sensor .values small { font-size: 0.85rem; font-weight: 400; color: var(--muted); }
+    .sensor.stale .values { opacity: 0.55; }
+    .light {
+      display: flex; align-items: center; justify-content: space-between; width: 100%;
+      font: inherit; color: var(--text); text-align: left; cursor: pointer;
+      min-height: 3.5rem; touch-action: manipulation;
+    }
+    .light:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .light:disabled { opacity: 0.6; cursor: progress; }
+    .light .label { font-size: 1.05rem; }
+    .light .badge {
+      font-size: 0.75rem; font-weight: 700; padding: 0.3rem 0.7rem; border-radius: 999px;
+      background: var(--border); color: var(--muted);
+    }
+    .light.on { border-color: var(--accent); }
+    .light.on .badge { background: var(--accent); color: var(--accent-text); }
+    .empty { color: var(--muted); font-style: italic; padding: 0.5rem 0; }
+    #error { color: var(--danger); font-size: 0.85rem; min-height: 1.2rem; margin: 0.5rem 0 0; }
   </style>
 </head>
 <body>
+  <header>
+    <h1>HA Lite</h1>
+    <div id="status" class="status" role="status">Connecting…</div>
+  </header>
+  <p id="error" role="alert"></p>
+
   <h2>Sensors</h2>
   <div id="sensors"></div>
+
+  <h2>Lights</h2>
   <div id="lights"></div>
+
   <script>
+    const STALE_SECS = 15 * 60;
+    const pending = new Set();
+
     function fmt(value, unit) {
-      return value == null ? '--' : `${value.toFixed(1)} ${unit}`;
+      return value == null ? '--' : `${value.toFixed(1)}${unit}`;
     }
 
-    function age(timestamp) {
-      if (!timestamp) return '';
-      const secs = Math.max(0, Math.round(Date.now() / 1000 - timestamp));
+    function ageSecs(timestamp) {
+      return Math.max(0, Math.round(Date.now() / 1000 - timestamp));
+    }
+
+    function age(secs) {
       if (secs < 60) return `${secs}s ago`;
       if (secs < 3600) return `${Math.round(secs / 60)}m ago`;
       return `${Math.round(secs / 3600)}h ago`;
     }
 
-    async function refresh() {
-      const res = await fetch('/api/state');
-      const data = await res.json();
+    function el(tag, className, text) {
+      const node = document.createElement(tag);
+      if (className) node.className = className;
+      if (text != null) node.textContent = text;
+      return node;
+    }
 
-      const sensorBox = document.getElementById('sensors');
-      sensorBox.replaceChildren();
-      const sensors = Object.entries(data.sensors ?? {});
-      if (sensors.length === 0) {
-        const placeholder = document.createElement('div');
-        placeholder.className = 'empty';
-        placeholder.textContent = 'Waiting for sensor data…';
-        sensorBox.appendChild(placeholder);
+    function setStatus(online) {
+      const status = document.getElementById('status');
+      status.className = online ? 'status' : 'status offline';
+      status.textContent = online ? 'Live' : 'Offline';
+    }
+
+    function renderSensors(sensors) {
+      const box = document.getElementById('sensors');
+      box.replaceChildren();
+      const entries = Object.entries(sensors ?? {});
+      if (entries.length === 0) {
+        box.appendChild(el('div', 'empty', 'Waiting for sensor data…'));
+        return;
       }
-      for (const [id, sensor] of sensors) {
-        const row = document.createElement('div');
-        row.className = 'sensor';
+      for (const [id, sensor] of entries) {
+        const secs = sensor.last_seen ? ageSecs(sensor.last_seen) : null;
+        const stale = secs != null && secs > STALE_SECS;
+        const row = el('div', stale ? 'card sensor stale' : 'card sensor');
 
-        const name = document.createElement('div');
-        name.className = 'name';
-        name.textContent = sensor.last_seen ? `${id} · ${age(sensor.last_seen)}` : id;
+        const name = el('div', 'name');
+        name.append(el('span', null, id));
+        if (secs != null) name.append(el('span', stale ? 'age stale' : 'age', age(secs)));
 
-        const values = document.createElement('div');
-        values.className = 'values';
-        values.textContent =
-          `${fmt(sensor.temp_c, '°C')} · ${fmt(sensor.humidity, '% humidity')}`;
+        const values = el('div', 'values');
+        const temp = el('span', null, fmt(sensor.temp_c, '°C'));
+        const hum = el('span', null, fmt(sensor.humidity, '%'));
+        hum.append(el('small', null, ' humidity'));
+        values.append(temp, hum);
 
         row.append(name, values);
-        sensorBox.appendChild(row);
+        box.appendChild(row);
       }
+    }
 
-      const container = document.getElementById('lights');
-      container.replaceChildren();
-      for (const [id, light] of Object.entries(data.lights)) {
-        const btn = document.createElement('button');
-        btn.textContent = `${light.name}: ${light.on ? 'ON' : 'OFF'}`;
+    function renderLights(lights) {
+      const box = document.getElementById('lights');
+      box.replaceChildren();
+      const entries = Object.entries(lights ?? {});
+      if (entries.length === 0) {
+        box.appendChild(el('div', 'empty', 'No lights discovered yet…'));
+        return;
+      }
+      for (const [id, light] of entries) {
+        const btn = el('button', light.on ? 'card light on' : 'card light');
+        btn.type = 'button';
+        btn.setAttribute('aria-pressed', String(!!light.on));
+        btn.disabled = pending.has(id);
+        btn.append(el('span', 'label', light.name), el('span', 'badge', light.on ? 'ON' : 'OFF'));
         // Send the state this button is asking for, not "flip": a double tap or
         // a second client then converges instead of undoing the first command.
         btn.addEventListener('click', () => setLight(id, !light.on));
-        container.appendChild(btn);
+        box.appendChild(btn);
       }
     }
-    async function setLight(id, on) {
-      await fetch(`/api/lights/${encodeURIComponent(id)}/${on ? 'on' : 'off'}`, {
-        method: 'POST',
-        headers: { 'X-Requested-With': 'ha-lite' },
-      });
-      setTimeout(refresh, 150);
+
+    async function refresh() {
+      try {
+        const res = await fetch('/api/state');
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        renderSensors(data.sensors);
+        renderLights(data.lights);
+        setStatus(true);
+      } catch (e) {
+        setStatus(false);
+      }
     }
+
+    async function setLight(id, on) {
+      const error = document.getElementById('error');
+      error.textContent = '';
+      pending.add(id);
+      refresh();
+      try {
+        const res = await fetch(`/api/lights/${encodeURIComponent(id)}/${on ? 'on' : 'off'}`, {
+          method: 'POST',
+          headers: { 'X-Requested-With': 'ha-lite' },
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      } catch (e) {
+        error.textContent = `Couldn't switch the light (${e.message}).`;
+      } finally {
+        pending.delete(id);
+        setTimeout(refresh, 150);
+      }
+    }
+
     setInterval(refresh, 2000);
     refresh();
   </script>
