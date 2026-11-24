@@ -6,18 +6,23 @@
 
 use std::{
     collections::BTreeMap,
-    sync::atomic::AtomicU64,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde::Serialize;
-use tokio::sync::RwLock;
+use tokio::{
+    sync::{Notify, RwLock},
+    task::{AbortHandle, JoinHandle},
+};
+use tracing::error;
 
 use crate::lights::LightRegistry;
 use crate::mqtt::MqttLink;
 
-#[cfg(test)]
-use std::sync::Arc;
 #[cfg(test)]
 use tokio::sync::mpsc;
 
@@ -55,6 +60,65 @@ pub(crate) struct AppContext {
     pub(crate) lights: RwLock<LightRegistry>,
     pub(crate) bthome_packets: AtomicU64,
     pub(crate) mqtt: MqttLink,
+    pub(crate) shutdown: Shutdown,
+}
+
+/// A way for background tasks to ask `main` to shut down cleanly and exit with
+/// a failure status, so the service manager restarts the process. Going through
+/// `main` (instead of `process::exit`) lets the BLE scans be stopped first.
+#[derive(Default)]
+pub(crate) struct Shutdown {
+    notify: Notify,
+    failed: AtomicBool,
+}
+
+impl Shutdown {
+    /// Ask for a shutdown because something is broken. Safe to call from any
+    /// task and more than once.
+    pub(crate) fn fail(&self) {
+        self.failed.store(true, Ordering::Relaxed);
+        // Stores a permit when nobody is waiting yet, so a request made before
+        // `requested` is polled is not lost.
+        self.notify.notify_one();
+    }
+
+    /// Whether the shutdown was requested through `fail`.
+    pub(crate) fn failed(&self) -> bool {
+        self.failed.load(Ordering::Relaxed)
+    }
+
+    /// Resolves once `fail` has been called.
+    pub(crate) async fn requested(&self) {
+        self.notify.notified().await;
+    }
+}
+
+/// Watch a task that is meant to run for the life of the process. If it panics
+/// or returns, the process would otherwise keep serving HTTP with that part
+/// dead, so request a shutdown instead. Aborting the task is not a failure.
+///
+/// Returns a handle to abort the task and the monitor to await, which finishes
+/// once the task is gone.
+pub(crate) fn supervise(
+    name: &'static str,
+    task: JoinHandle<()>,
+    ctx: Arc<AppContext>,
+) -> (AbortHandle, JoinHandle<()>) {
+    let abort = task.abort_handle();
+    let monitor = tokio::spawn(async move {
+        match task.await {
+            Err(e) if e.is_cancelled() => {}
+            Err(e) => {
+                error!(task = name, error = %e, "task panicked; shutting down so the service manager restarts it");
+                ctx.shutdown.fail();
+            }
+            Ok(()) => {
+                error!(task = name, "task ended unexpectedly; shutting down so the service manager restarts it");
+                ctx.shutdown.fail();
+            }
+        }
+    });
+    (abort, monitor)
 }
 
 /// Most distinct sensor sources kept in `HomeState::sensors`.
@@ -141,6 +205,7 @@ pub(crate) fn test_ctx(
         lights: RwLock::new(LightRegistry::default()),
         bthome_packets: AtomicU64::new(0),
         mqtt,
+        shutdown: Shutdown::default(),
     });
     (ctx, eventloop, request_rx)
 }
@@ -148,6 +213,42 @@ pub(crate) fn test_ctx(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_shutdown_requested_before_anyone_waits_is_not_lost() {
+        let shutdown = Shutdown::default();
+        assert!(!shutdown.failed());
+
+        shutdown.fail();
+
+        assert!(shutdown.failed());
+        tokio::time::timeout(std::time::Duration::from_secs(1), shutdown.requested())
+            .await
+            .expect("the stored request resolves immediately");
+    }
+
+    #[tokio::test]
+    async fn a_panicking_task_requests_a_shutdown() {
+        let (ctx, _eventloop, _requests) = test_ctx(false, 4);
+        let task = tokio::spawn(async { panic!("boom") });
+
+        let (_abort, monitor) = supervise("test task", task, ctx.clone());
+        monitor.await.unwrap();
+
+        assert!(ctx.shutdown.failed());
+    }
+
+    #[tokio::test]
+    async fn aborting_a_supervised_task_is_not_a_failure() {
+        let (ctx, _eventloop, _requests) = test_ctx(false, 4);
+        let task = tokio::spawn(std::future::pending::<()>());
+
+        let (abort, monitor) = supervise("test task", task, ctx.clone());
+        abort.abort();
+        monitor.await.unwrap();
+
+        assert!(!ctx.shutdown.failed());
+    }
 
     #[test]
     fn two_sensors_keep_their_own_readings() {

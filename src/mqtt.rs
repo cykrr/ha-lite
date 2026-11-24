@@ -265,12 +265,14 @@ pub(crate) async fn run_event_loop(ctx: Arc<AppContext>, mut eventloop: rumqttc:
     }
 }
 
-/// Exit when the MQTT event loop stops making progress.
+/// Request a shutdown when the MQTT event loop stops making progress.
 ///
-/// The event loop is a spawned task, so a panic in it (or a future that never
-/// returns) leaves the process itself running: HTTP keeps answering `/api/state`
-/// but every toggle fails with 502 until someone restarts it by hand. Exiting
-/// hands recovery to the service manager instead (`Restart=on-failure`).
+/// The event loop is a spawned task, so a future that never returns leaves the
+/// process itself running: HTTP keeps answering `/api/state` but every toggle
+/// fails with 502 until someone restarts it by hand. (A panic or early return
+/// is caught sooner by `supervise`.) Shutting down through `main` stops the BLE
+/// scans first and then exits non-zero, which hands recovery to the service
+/// manager (`Restart=on-failure`).
 pub(crate) async fn watch_event_loop(ctx: Arc<AppContext>) {
     let mut previous = ctx.mqtt.polls();
     let mut stalled = 0u32;
@@ -285,9 +287,10 @@ pub(crate) async fn watch_event_loop(ctx: Arc<AppContext>) {
         if give_up {
             tracing::error!(
                 stalled_secs = WATCHDOG_INTERVAL.as_secs() * WATCHDOG_STALL_LIMIT as u64,
-                "MQTT event loop stopped making progress; exiting so the service manager restarts it"
+                "MQTT event loop stopped making progress; shutting down so the service manager restarts it"
             );
-            std::process::exit(1);
+            ctx.shutdown.fail();
+            return;
         }
     }
 }

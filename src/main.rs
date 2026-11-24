@@ -12,6 +12,7 @@ mod lights;
 mod mqtt;
 
 use std::{
+    process::ExitCode,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -28,7 +29,7 @@ use rumqttc::MqttOptions;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
-use app::{AppContext, HomeState};
+use app::{AppContext, HomeState, Shutdown};
 use lights::LightRegistry;
 
 fn env_or(key: &str, default: &str) -> String {
@@ -38,20 +39,28 @@ fn env_or(key: &str, default: &str) -> String {
         .unwrap_or_else(|| default.to_string())
 }
 
-/// Leave a restart to the service manager when any task panics.
+/// How long a shutdown requested by a failing task may take before the process
+/// is ended anyway. Graceful HTTP shutdown waits for open connections, and a
+/// browser holding a keep-alive connection could stall it indefinitely.
+const FAILURE_SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+
+/// Resolve when the process should shut down: on a termination signal, or when
+/// a task that must stay alive (MQTT, BLE) has died.
 ///
-/// A panic in a spawned task (the MQTT event loop, the BLE scanner) only kills
-/// that task; the process keeps running and the HTTP API still answers, so the
-/// UI looks alive while every toggle fails. The default hook still prints the
-/// panic and, with `RUST_BACKTRACE=1`, a backtrace to stderr (the journal under
-/// systemd); exiting afterwards lets `Restart=on-failure` start a clean
-/// instance instead of leaving a half-dead one.
-fn exit_on_panic() {
-    let default_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        default_hook(info);
-        std::process::exit(1);
-    }));
+/// A task failure ends with a non-zero exit so `Restart=on-failure` brings the
+/// service back, but only after `main` has stopped the BLE scans. If that
+/// cleanup stalls, the process is ended anyway after a grace period.
+async fn shutdown_signal(ctx: Arc<AppContext>) {
+    tokio::select! {
+        _ = termination_signal() => {}
+        _ = ctx.shutdown.requested() => {
+            tokio::spawn(async {
+                tokio::time::sleep(FAILURE_SHUTDOWN_GRACE).await;
+                error!("graceful shutdown did not finish in time; exiting");
+                std::process::exit(1);
+            });
+        }
+    }
 }
 
 /// Wait for a termination signal. Service managers and containers stop a
@@ -59,7 +68,7 @@ fn exit_on_panic() {
 /// SIGTERM action ends the process before any cleanup can run. Where the
 /// platform has it, race SIGTERM against Ctrl-C so both paths shut down
 /// gracefully.
-async fn shutdown_signal() {
+async fn termination_signal() {
     let ctrl_c = async {
         if let Err(e) = tokio::signal::ctrl_c().await {
             // Keep the other signal (if any) alive rather than resolving early.
@@ -95,9 +104,7 @@ async fn shutdown_signal() {
 }
 
 #[tokio::main]
-async fn main() {
-    exit_on_panic();
-
+async fn main() -> ExitCode {
     // Load .env before the subscriber so RUST_LOG can be set there too.
     let _ = dotenv::dotenv();
 
@@ -134,6 +141,7 @@ async fn main() {
         lights: RwLock::new(LightRegistry::default()),
         bthome_packets: AtomicU64::new(0),
         mqtt,
+        shutdown: Shutdown::default(),
     });
 
     // An empty BTHome feed should be loud, not silent.
@@ -159,20 +167,32 @@ async fn main() {
     });
 
     // Scan BLE directly for BTHome service data (UUID 0xFCD2).
-    let ble_handle = tokio::spawn(ble::ble_scanner(ctx.clone()));
+    // Both background tasks are supervised: if one panics, the process would
+    // otherwise keep answering HTTP with that part dead, so a panic requests a
+    // shutdown instead. Only these tasks are covered; a panic while serving one
+    // HTTP request still only drops that connection.
+    let (ble_abort, ble_monitor) = app::supervise(
+        "BLE scanner",
+        tokio::spawn(ble::ble_scanner(ctx.clone())),
+        ctx.clone(),
+    );
 
     // Background MQTT listener with automatic reconnect.
-    tokio::spawn(mqtt::run_event_loop(ctx.clone(), eventloop));
+    app::supervise(
+        "MQTT event loop",
+        tokio::spawn(mqtt::run_event_loop(ctx.clone(), eventloop)),
+        ctx.clone(),
+    );
 
-    // If that listener ever stops making progress, leave a restart to systemd
-    // instead of serving 502s forever from a half-dead process.
+    // The listener can also hang without panicking; catch that too, rather
+    // than serving 502s forever from a half-dead process.
     tokio::spawn(mqtt::watch_event_loop(ctx.clone()));
 
     let app = Router::new()
         .route("/", get(|| async { Html(include_str!("index.html")) }))
         .route("/api/state", get(http::get_state))
         .route("/api/lights/:id/toggle", post(http::toggle_light))
-        .with_state(ctx);
+        .with_state(ctx.clone());
 
     // Bind on all interfaces by default; set HA_LITE_HOST=127.0.0.1 to sit
     // behind a reverse proxy, or HA_LITE_PORT to run a second instance.
@@ -184,22 +204,30 @@ async fn main() {
         Ok(listener) => listener,
         Err(e) => {
             error!(error = %e, %bind_addr, "failed to bind HTTP listener; exiting");
-            return;
+            return ExitCode::FAILURE;
         }
     };
     info!(%bind_addr, "HTTP server listening");
     if let Err(e) = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown_signal(ctx.clone()))
         .await
     {
         error!(error = %e, "HTTP server failed");
     }
 
     // Stop the supervisor before clearing scans, otherwise a restart could
-    // re-arm discovery in the window between the two. Awaiting the aborted
-    // handle guarantees the task is gone and no longer holds an adapter.
-    ble_handle.abort();
-    let _ = ble_handle.await;
+    // re-arm discovery in the window between the two. Awaiting the monitor
+    // guarantees the task is gone and no longer holds an adapter.
+    ble_abort.abort();
+    let _ = ble_monitor.await;
     ble::stop_ble_scans().await;
     info!("shutting down");
+
+    // A task failure must not look like a clean stop, or
+    // `Restart=on-failure` would leave the service down.
+    if ctx.shutdown.failed() {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
 }

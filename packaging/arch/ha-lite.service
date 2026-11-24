@@ -11,7 +11,7 @@ Group=ha-lite
 SupplementaryGroups=bluetooth
 EnvironmentFile=-/etc/ha-lite/ha-lite.env
 # Journal the panic message and a backtrace if a task ever dies; the process
-# then exits so Restart=on-failure can bring it back cleanly.
+# then stops the BLE scans and exits non-zero so Restart=on-failure restarts it.
 Environment=RUST_BACKTRACE=1
 ExecStart=/usr/bin/ha-lite
 Restart=on-failure
